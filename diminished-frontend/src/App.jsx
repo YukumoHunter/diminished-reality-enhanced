@@ -10,6 +10,9 @@ import "./App.css";
 const socket = new WebSocket('wss://diminish.soaratorium.com:5174');
 
 function App() {
+  const WIDTH = 640;
+  const HEIGHT = 640;
+
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
@@ -40,7 +43,7 @@ function App() {
     if (!webcamRef.current || socket.readyState !== WebSocket.OPEN) return;
 
     try {
-      const imageSrc = webcamRef.current.getScreenshot();
+      const imageSrc = webcamRef.current.getScreenshot({ width: WIDTH, height: HEIGHT });
       if (!imageSrc) return;
 
       const requestId = Date.now() + Math.random();
@@ -260,8 +263,8 @@ function App() {
         className="webcam-component"
         ref={webcamRef}
         onLoadedMetadata={handleResize}
-        width={640}
-        height={640}
+        width={WIDTH}
+        height={HEIGHT}
         screenshotFormat="image/jpeg"
         videoConstraints={{
           facingMode: "environment",
