@@ -199,6 +199,10 @@ SCHIJF_VAN_VIJF = {
     "Ecoplaza Pastasaus sugo tradizionale": False,
 }
 
+# TESTING: set all to False
+for k in SCHIJF_VAN_VIJF:
+    SCHIJF_VAN_VIJF[k] = False
+
 
 def run_inference_sync(image_bytes, request_id):
     """
