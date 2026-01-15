@@ -1,4 +1,4 @@
-export const SCHIJF_VAN_VIJF_DEFAULTS = {
+export const SCHIJF_VAN_VIJF_DEFAULTS_TRUE = {
     // Peanut Butter
     "Calvé Pindakaas Original": false,
     "Skippy Creamy peanut butter": false,
@@ -73,5 +73,10 @@ export const SCHIJF_VAN_VIJF_DEFAULTS = {
     "Fertilia Pastasaus traditionale": false,
     "Ecoplaza Pastasaus sugo tradizionale": false,
 };
+
+// set all to true for testing purposes
+export const SCHIJF_VAN_VIJF_DEFAULTS = Object.fromEntries(
+    Object.keys(SCHIJF_VAN_VIJF_DEFAULTS_TRUE).map(key => [key, true])
+);
 
 export const ALL_PRODUCTS = Object.keys(SCHIJF_VAN_VIJF_DEFAULTS).sort();

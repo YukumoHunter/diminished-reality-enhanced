@@ -1,16 +1,16 @@
 import asyncio
 import websockets
 import numpy as np
-import torch
+from PIL import Image, ImageOps
 from time import perf_counter
 from turbojpeg import TurboJPEG, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
 import base64
 import json
 import ssl
+import torch
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
 import onnxruntime as ort
-import cv2
 import os
 
 BASE_DIR = pathlib.Path(__file__).parent.parent / "cert"
@@ -120,7 +120,7 @@ CLASS_MAPPING = {
     57: "Alesto Noten mix",
     58: "TastyBasics Low carb-high protein cracker meerzaden",
     59: "AH Stevige crackers waldkorn",
-    60: "Hak  witten bonen in tomatensaus",
+    60: "Hak witte bonen in tomatensaus",
 }
 
 SCHIJF_VAN_VIJF = {
@@ -204,6 +204,38 @@ for k in SCHIJF_VAN_VIJF:
     SCHIJF_VAN_VIJF[k] = False
 
 
+def get_real_coordinates(boxes_norm, orig_w, orig_h, model_dim=560):
+    """
+    boxes_norm: np.array of shape (N, 4) -> [cx, cy, w, h] (0-1 normalized)
+    """
+    # 1. Denormalize to the model's 560x560 frame
+    # We multiply by 560, NOT original_w/h yet
+    boxes_560 = boxes_norm * model_dim  # [cx, cy, w, h] in 560 pixels
+
+    # 2. Calculate the Padding and Scale used by ImageOps.pad
+    scale = min(model_dim / orig_w, model_dim / orig_h)
+    pad_x = (model_dim - orig_w * scale) / 2
+    pad_y = (model_dim - orig_h * scale) / 2
+
+    # 3. Remove Padding (Shift) and Scale Back (Resize)
+    # Apply to Center X and Center Y
+    cx_real = (boxes_560[:, 0] - pad_x) / scale
+    cy_real = (boxes_560[:, 1] - pad_y) / scale
+
+    # Apply to Width and Height (only Scale, no shift)
+    w_real = boxes_560[:, 2] / scale
+    h_real = boxes_560[:, 3] / scale
+
+    # 4. Convert Center-Format [cx, cy, w, h] -> Corner-Format [x1, y1, x2, y2]
+    # Supervision expects [x1, y1, x2, y2]
+    x1 = cx_real - (w_real / 2)
+    y1 = cy_real - (h_real / 2)
+    x2 = cx_real + (w_real / 2)
+    y2 = cy_real + (h_real / 2)
+
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
 def run_inference_sync(image_bytes, request_id):
     """
     Synchronous function to handle image decoding and inference.
@@ -225,12 +257,13 @@ def run_inference_sync(image_bytes, request_id):
         original_h, original_w = img.shape[:2]
 
         # 2. Preprocess
-        img_resized = cv2.resize(img, (model_w, model_h))
-        img_data = img_resized.astype(np.float32) / 255.0
+        img = Image.fromarray(img)
+        img = ImageOps.pad(img, (model_w, model_h))
 
         # (H,W,C) -> (C,H,W) -> (1,C,H,W)
-        img_data = img_data.transpose(2, 0, 1)
-        input_tensor = np.expand_dims(img_data, axis=0)
+        img = torch.from_numpy(np.asarray(img)).float() / 255.0
+        img = img.transpose(2, 0, 1)
+        input_tensor = img.unsqueeze(0)
 
         # 3. Inference
         start = perf_counter()
@@ -250,7 +283,7 @@ def run_inference_sync(image_bytes, request_id):
 
         detections = []
         num_queries = boxes.shape[0]
-        threshold = 0.3
+        threshold = 0.5
 
         for i in range(num_queries):
             class_id = np.argmax(probs[i])
@@ -268,16 +301,24 @@ def run_inference_sync(image_bytes, request_id):
                 # Unpack Box: [cx, cy, w, h] (Normalized)
                 cx, cy, w, h = boxes[i]
 
-                # Convert to Pixel Coordinates [x1, y1, x2, y2]
+                # Convert to [x1, y1, x2, y2] in original image coordinates
+                xyxy_boxes = get_real_coordinates(
+                    boxes[i], original_w, original_h, model_dim=model_w
+                )
+                # Convert [x1, y1, x2, y2] to [x, y, w, h]
+                x1, y1, x2, y2 = xyxy_boxes[0]
+                width_px = x2 - x1
+                height_px = y2 - y1
+
                 # Output API expects [x, y, w, h]
 
-                x_center = cx * original_w
-                y_center = cy * original_h
-                width_px = w * original_w
-                height_px = h * original_h
+                # x_center = cx * original_w
+                # y_center = cy * original_h
+                # width_px = w * original_w
+                # height_px = h * original_h
 
-                x1 = x_center - width_px / 2
-                y1 = y_center - height_px / 2
+                # x1 = x_center - width_px / 2
+                # y1 = y_center - height_px / 2
 
                 detections.append(
                     {

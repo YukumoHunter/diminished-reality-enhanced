@@ -10,8 +10,8 @@ import "./App.css";
 const socket = new WebSocket('wss://diminish.soaratorium.com:5174');
 
 function App() {
-  const WIDTH = 640;
-  const HEIGHT = 640;
+  const WIDTH = 560;
+  const HEIGHT = 560;
 
   const webcamRef = useRef(null);
   const canvasRef = useRef(null);
