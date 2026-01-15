@@ -262,7 +262,7 @@ def run_inference_sync(image_bytes, request_id):
 
         # (H,W,C) -> (C,H,W) -> (1,C,H,W)
         img = torch.from_numpy(np.asarray(img)).float() / 255.0
-        img = img.transpose(2, 0, 1)
+        img = img.permute((2, 0, 1))
         input_tensor = img.unsqueeze(0)
 
         # 3. Inference
