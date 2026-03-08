@@ -12,6 +12,8 @@ import pathlib
 from concurrent.futures import ThreadPoolExecutor
 import onnxruntime as ort
 import os
+from trackers import ByteTrackTracker
+import supervision as sv
 
 BASE_DIR = pathlib.Path(__file__).parent.parent / "cert"
 SSL_CERT_PATH = BASE_DIR / "cert.pem"
@@ -236,7 +238,7 @@ def get_real_coordinates(boxes_norm, orig_w, orig_h, model_dim=560):
     return np.stack([x1, y1, x2, y2], axis=1)
 
 
-def run_inference_sync(image_bytes, request_id):
+def run_inference_sync(image_bytes, request_id, tracker):
     """
     Synchronous function to handle image decoding and inference.
     This runs in a separate thread to keep the Websocket heartbeat alive.
@@ -273,7 +275,7 @@ def run_inference_sync(image_bytes, request_id):
         inference_time = (end - start) * 1000
         print(f"inference took {inference_time:.2f}ms")
 
-        # 4. Format Results
+        # 4. Format Results (vectorized)
         box_data = raw_results[output_map["dets"]]  # Shape: [1, N, 4]
         score_data = raw_results[output_map["labels"]]  # Shape: [1, N, 61]
 
@@ -281,58 +283,57 @@ def run_inference_sync(image_bytes, request_id):
         logits = score_data[0]
         probs = softmax(logits)
 
-        detections = []
         num_queries = boxes.shape[0]
         threshold = 0.5
 
-        for i in range(num_queries):
-            class_id = np.argmax(probs[i])
-            score = probs[i][class_id]
+        # Vectorized filtering
+        class_ids = np.argmax(probs, axis=1)
+        scores = probs[np.arange(num_queries), class_ids]
 
-            # Filter by Threshold and Background (class 60)
-            if score > threshold and class_id < 60:
-                # Map class_id (0-based) to CLASS_MAPPING (1-based)
-                mapped_id = class_id + 1
-                if mapped_id not in CLASS_MAPPING:
-                    continue
+        valid_mask = (scores > threshold) & (class_ids < 60)
+        mapped_ids = class_ids + 1
+        has_mapping = np.array([int(mid) in CLASS_MAPPING for mid in mapped_ids])
+        valid_mask = valid_mask & has_mapping
 
-                class_name = CLASS_MAPPING[mapped_id]
+        valid_boxes = boxes[valid_mask]
+        valid_scores = scores[valid_mask]
+        valid_class_ids = class_ids[valid_mask]
 
-                # Unpack Box: [cx, cy, w, h] (Normalized)
-                cx, cy, w, h = boxes[i]
+        if len(valid_boxes) == 0:
+            return {"detections": [], "requestId": request_id}
 
-                # Convert to [x1, y1, x2, y2] in original image coordinates
-                xyxy_boxes = get_real_coordinates(
-                    boxes[i], original_w, original_h, model_dim=model_w
-                )
-                # Convert [x1, y1, x2, y2] to [x, y, w, h]
-                x1, y1, x2, y2 = xyxy_boxes[0]
-                width_px = x2 - x1
-                height_px = y2 - y1
+        # Convert to xyxy coordinates
+        xyxy = get_real_coordinates(valid_boxes, original_w, original_h, model_dim=model_w)
 
-                # Output API expects [x, y, w, h]
+        # Run ByteTrack tracker
+        sv_detections = sv.Detections(
+            xyxy=xyxy.astype(np.float32),
+            confidence=valid_scores.astype(np.float32),
+            class_id=valid_class_ids.astype(int),
+        )
+        sv_detections = tracker.update(sv_detections)
 
-                # x_center = cx * original_w
-                # y_center = cy * original_h
-                # width_px = w * original_w
-                # height_px = h * original_h
+        # Build response
+        detections = []
+        for i in range(len(sv_detections)):
+            mapped_id = int(sv_detections.class_id[i]) + 1
+            class_name = CLASS_MAPPING[mapped_id]
 
-                # x1 = x_center - width_px / 2
-                # y1 = y_center - height_px / 2
+            x1, y1, x2, y2 = sv_detections.xyxy[i]
+            width_px = x2 - x1
+            height_px = y2 - y1
 
-                detections.append(
-                    {
-                        "class": class_name,
-                        "confidence": float(score),
-                        "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
-                        "bbox": [
-                            float(x1),
-                            float(y1),
-                            float(width_px),
-                            float(height_px),
-                        ],
-                    }
-                )
+            det = {
+                "class": class_name,
+                "confidence": float(sv_detections.confidence[i]),
+                "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
+                "bbox": [float(x1), float(y1), float(width_px), float(height_px)],
+            }
+
+            if sv_detections.tracker_id is not None:
+                det["tracker_id"] = int(sv_detections.tracker_id[i])
+
+            detections.append(det)
 
         return {"detections": detections, "requestId": request_id}
 
@@ -341,24 +342,30 @@ def run_inference_sync(image_bytes, request_id):
         return {"error": str(e)}
 
 
-async def inference_worker(websocket, queue):
+async def inference_worker(websocket, queue, tracker):
     """
     Consumer: Pulls frames from queue and runs inference.
     """
     while True:
         # Get the next frame from the queue
-        data_str = await queue.get()
+        message = await queue.get()
 
         try:
-            data = json.loads(data_str)
-            request_id = data.get("requestId")
-            image_data = data["image"].split(",")[1]
-            image_bytes = base64.b64decode(image_data)
+            if isinstance(message, bytes):
+                # Binary protocol: [4 bytes uint32 requestId BE] + [JPEG bytes]
+                request_id = int.from_bytes(message[:4], byteorder="big")
+                image_bytes = message[4:]
+            else:
+                # Legacy JSON/base64 fallback
+                data = json.loads(message)
+                request_id = data.get("requestId")
+                image_data = data["image"].split(",")[1]
+                image_bytes = base64.b64decode(image_data)
 
             # Run inference in a separate thread so we don't block the event loop
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
-                executor, run_inference_sync, image_bytes, request_id
+                executor, run_inference_sync, image_bytes, request_id, tracker
             )
 
             # Send result back
@@ -378,8 +385,11 @@ async def detect_frame_handler(websocket):
     # If the GPU is busy, we drop incoming frames.
     queue = asyncio.Queue(maxsize=1)
 
+    # Per-connection tracker for persistent object IDs
+    tracker = ByteTrackTracker()
+
     # Start the consumer task
-    worker_task = asyncio.create_task(inference_worker(websocket, queue))
+    worker_task = asyncio.create_task(inference_worker(websocket, queue, tracker))
 
     try:
         async for message in websocket:

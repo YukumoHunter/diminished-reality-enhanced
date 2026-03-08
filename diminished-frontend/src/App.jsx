@@ -23,7 +23,13 @@ function App() {
   // For RTT testing.
   const pendingRequests = useRef(new Map());
   const rttArray = useRef([]);
-  const MAX_RTT_RECORDS = 1000; 
+  const MAX_RTT_RECORDS = 1000;
+
+  // Binary protocol request ID counter
+  const requestIdCounter = useRef(0);
+
+  // Latest detections for continuous rendering
+  const latestDetectionsRef = useRef([]);
 
   // Settings values
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -46,15 +52,27 @@ function App() {
       const imageSrc = webcamRef.current.getScreenshot({ width: WIDTH, height: HEIGHT });
       if (!imageSrc) return;
 
-      const requestId = Date.now() + Math.random();
+      // Incrementing uint32 request ID
+      requestIdCounter.current = (requestIdCounter.current + 1) & 0xFFFFFFFF;
+      const requestId = requestIdCounter.current;
       const startTime = performance.now();
       pendingRequests.current.set(requestId, startTime);
 
-      // Send the screenshot through WebSocket
-      socket.send(JSON.stringify({
-        image: imageSrc,
-        requestId: requestId
-      }));
+      // Convert base64 data URL to binary
+      const base64Data = imageSrc.split(',')[1];
+      const binaryString = atob(base64Data);
+      const jpegBytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        jpegBytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // Binary message: [4 bytes uint32 requestId BE] + [JPEG bytes]
+      const message = new ArrayBuffer(4 + jpegBytes.length);
+      const view = new DataView(message);
+      view.setUint32(0, requestId, false); // big-endian
+      new Uint8Array(message, 4).set(jpegBytes);
+
+      socket.send(message);
 
     } catch (error) {
       console.error('Detection error:', error);
@@ -133,18 +151,8 @@ function App() {
         }
       }
 
-      // Process the detection results
-      if (canvasRef.current && webcamRef.current?.video) {
-        diminishObject(
-          canvasRef.current,
-          webcamRef.current.video,
-          data.detections,
-          settingsRef.current.diminishEffect,
-          settingsRef.current.useOutline,
-          settingsRef.current.outlineColor,
-          settingsRef.current.classOverrides
-        );
-      }
+      // Store detections for continuous rAF rendering
+      latestDetectionsRef.current = data.detections || [];
     };
 
     socket.onerror = (error) => {
@@ -247,6 +255,29 @@ function App() {
       classOverrides
     };
   }, [diminishEffect, useOutline, outlineColor, classOverrides]);
+
+  // Continuous 60fps rendering loop, decoupled from inference
+  useEffect(() => {
+    let animationFrameId;
+
+    const renderLoop = () => {
+      if (canvasRef.current && webcamRef.current?.video) {
+        diminishObject(
+          canvasRef.current,
+          webcamRef.current.video,
+          latestDetectionsRef.current,
+          settingsRef.current.diminishEffect,
+          settingsRef.current.useOutline,
+          settingsRef.current.outlineColor,
+          settingsRef.current.classOverrides
+        );
+      }
+      animationFrameId = requestAnimationFrame(renderLoop);
+    };
+
+    animationFrameId = requestAnimationFrame(renderLoop);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, []);
 
   return (
     <div className={`container ${isMovingTooFast ? 'moving-too-fast' : ''}`} ref={containerRef}>
