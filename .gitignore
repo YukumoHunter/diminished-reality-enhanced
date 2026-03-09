@@ -8,9 +8,6 @@ __pycache__/
 node_modules/
 dist/
 
-# Model (too large for git)
-backend/model/model.onnx
-
 # TensorRT caches
 *.engine
 *.trt
