@@ -8,19 +8,27 @@ Diminished Reality — a mobile web app that uses real-time object detection to 
 
 ## Commands
 
-### Frontend (`diminished-frontend/`)
+### Full app
 ```bash
-pnpm install       # install dependencies
-pnpm dev           # dev server with HTTPS (requires ../cert/)
-pnpm build         # production build → dist/
-pnpm lint          # ESLint
-pnpm preview       # preview production build
+# Run to start Linux/macOS:
+./start-backend.sh
+./start-frontend.sh
+# Or on Windows:
+start-backend.bat
+start-frontend.bat
 ```
 
-### Backend (`back-end/`)
+### Frontend (`frontend/`)
+```bash
+pnpm install       # install dependencies
+pnpm dev           # dev server with auto HTTPS + WS proxy
+pnpm build         # production build → dist/
+```
+
+### Backend (`backend/`)
 ```bash
 uv sync            # install Python dependencies
-uv run python back-end.py   # start WSS server on 0.0.0.0:5174
+uv run python server.py   # start WS server on 0.0.0.0:5174
 ```
 
 No test framework is configured in either package.
@@ -28,34 +36,38 @@ No test framework is configured in either package.
 ## Architecture
 
 **Data flow:**
-1. Frontend captures 560×560 JPEG frames from webcam every 200ms
-2. Sends `{image: base64, requestId}` over WebSocket to `wss://diminish.soaratorium.com:5174`
-3. Backend: TurboJPEG decode → ImageOps.pad(560×560) → ONNX inference (TensorRT/FP16)
-4. Model outputs `dets` (cx,cy,w,h normalized) + `labels` (61-class logits)
-5. Backend filters (confidence > 0.5, class < 60), transforms coordinates, looks up `SCHIJF_VAN_VIJF` health status
-6. Returns `{detections: [{class, confidence, bbox, in_schijf_van_vijf}]}`
-7. Frontend draws canvas effects per detection via `DiminishObject.jsx`
+1. Frontend captures JPEG frames from native camera via `canvas.toBlob()`
+2. Sends `[4-byte uint32 requestId BE] + [JPEG bytes]` binary over WebSocket
+3. Vite proxies `/ws` → `ws://localhost:5174` (backend runs plain WS, no SSL)
+4. Backend: TurboJPEG decode → ImageOps.pad → ONNX inference (TensorRT/FP16)
+5. ByteTrack tracker assigns persistent `tracker_id` per detection
+6. Returns JSON `{detections: [{class, confidence, bbox, in_schijf_van_vijf, tracker_id}]}`
+7. Frontend EMA-smooths bounding boxes per `tracker_id`, renders at 60fps via rAF
 
 **Key files:**
-- [back-end/back-end.py](back-end/back-end.py) — WebSocket server, ONNX inference, coordinate math, `SCHIJF_VAN_VIJF` health dict (currently all `False` for testing)
-- [diminished-frontend/src/App.jsx](diminished-frontend/src/App.jsx) — WebSocket client, webcam capture, motion detection, settings state
-- [diminished-frontend/src/DiminishObject.jsx](diminished-frontend/src/DiminishObject.jsx) — Canvas rendering; 4 effect types: None/Blur/Overlay/Desaturate; iOS-specific implementations
-- [diminished-frontend/src/constants.js](diminished-frontend/src/constants.js) — `SCHIJF_VAN_VIJF_DEFAULTS` health status for 60 Dutch food products
-- [diminished-frontend/src/Settings.jsx](diminished-frontend/src/Settings.jsx) — Settings panel; per-product health overrides
+- `backend/server.py` — WebSocket server, ONNX inference, ByteTrack tracking, coordinate math
+- `frontend/src/App.jsx` — Camera, WebSocket, adaptive frame capture, EMA bbox smoothing, rAF loop
+- `frontend/src/effects.js` — Canvas rendering; 4 effects (None/Blur/Overlay/Desaturate); iOS manual pixel paths; coordinate scaling for `object-fit: cover`
+- `frontend/src/constants.js` — `SCHIJF_VAN_VIJF` health status for 60+ Dutch food products
+- `frontend/src/Settings.jsx` — Dark glassmorphism settings panel; per-product health overrides
 
 **Performance:**
-- Backend uses a queue (maxsize=1) that drops stale frames when GPU is busy; inference runs in `ThreadPoolExecutor`
-- Frontend measures RTT in `rttArray` (max 1000 samples)
-- Motion detection (DeviceMotionEvent) skips inference during fast phone movement (accel > 20 m/s², rotation > 270 deg/s)
+- Backend: `asyncio.Queue(maxsize=1)` drops stale frames; `ThreadPoolExecutor(max_workers=1)` for non-blocking inference
+- Frontend: adaptive send rate (waits for response or 500ms timeout); EMA smoothing with fade in/out; 60fps rendering decoupled from inference
+- Binary WebSocket protocol avoids base64 overhead
+- Pure numpy preprocessing (no torch dependency, saves ~858MB)
 
-## SSL / Certificates
+## Network / SSL
 
-Both backend and frontend require HTTPS. Certificates live at `cert/cert.pem` and `cert/key.pem` (relative to repo root). The `ca/` directory holds the CA for the `diminish.soaratorium.com` domain. The backend also reads from that path at startup.
+- Backend runs plain `ws://` on port 5174 (no SSL needed)
+- Frontend uses `@vitejs/plugin-basic-ssl` for auto self-signed HTTPS
+- Vite proxies `/ws` → `ws://localhost:5174`
+- Phones on local hotspot connect to `https://<host-ip>:5173`, accept cert warning once
 
 ## iOS Quirks
 
-`DiminishObject.jsx` has separate code paths for iOS: OffscreenCanvas is used differently, blur/desaturation are implemented manually (CSS filters are unavailable), and fullscreen uses the webkit API.
+`effects.js` detects iOS via UA string. On iOS: OffscreenCanvas + manual pixel blur/desaturation (CSS filters unavailable). Fullscreen uses `webkitRequestFullscreen`.
 
 ## Model
 
-`back-end/model/model.onnx` (~130 MB) is not tracked in git. The model is a DETR-based detector with 60 product classes + background (61 output channels).
+`backend/model/model.onnx` (~130 MB) is not tracked in git. The model is a DETR-based detector with 60 product classes + background (61 output channels). Place it at `backend/model/model.onnx`.

@@ -1,25 +1,20 @@
 import asyncio
-import websockets
-import numpy as np
-from PIL import Image, ImageOps
-from time import perf_counter
-from turbojpeg import TurboJPEG, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
-import base64
 import json
-import ssl
-import torch
+import os
 import pathlib
 from concurrent.futures import ThreadPoolExecutor
+from time import perf_counter
+
+import numpy as np
 import onnxruntime as ort
-import os
-from trackers import ByteTrackTracker
 import supervision as sv
+import websockets
+from PIL import Image, ImageOps
+from trackers import ByteTrackTracker
+from turbojpeg import TurboJPEG, TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE
 
-BASE_DIR = pathlib.Path(__file__).parent.parent / "cert"
-SSL_CERT_PATH = BASE_DIR / "cert.pem"
-SSL_KEY_PATH = BASE_DIR / "key.pem"
+# --- ONNX Model ---
 
-# Initialize Model
 providers = [
     (
         "TensorrtExecutionProvider",
@@ -32,35 +27,38 @@ providers = [
     "CUDAExecutionProvider",
 ]
 
-print("Loading inference_model.onnx...")
+print("Loading model/model.onnx...")
 session = ort.InferenceSession("model/model.onnx", providers=providers)
 
-# Analyze Inputs
 input_name = session.get_inputs()[0].name
 input_shape = session.get_inputs()[0].shape
 model_h, model_w = input_shape[2], input_shape[3]
 
-# Analyze Outputs
 output_map = {}
 for i, node in enumerate(session.get_outputs()):
     output_map[node.name] = i
+
+# --- TurboJPEG ---
 
 if os.name == "nt":
     jpeg = TurboJPEG(r"C:\libjpeg-turbo-gcc64\bin\libturbojpeg.dll")
 else:
     jpeg = TurboJPEG()
 
-# Create a ThreadPool for running inference without blocking the asyncio event loop
-# This prevents the websocket from timing out during heavy computation
+# --- Thread pool ---
+
 executor = ThreadPoolExecutor(max_workers=1)
 
-# Warm up model (Optional but good practice)
-# We need to construct a dummy input matching the ONNX expectation
+# --- Warmup ---
+
 dummy_input = np.zeros((1, 3, model_h, model_w), dtype=np.float32)
 try:
     session.run(None, {input_name: dummy_input})
+    print("Model warmup complete.")
 except Exception as e:
     print(f"Warmup failed: {e}")
+
+# --- Class & health data ---
 
 CLASS_MAPPING = {
     1: "AH Rode linzen penne",
@@ -172,7 +170,7 @@ SCHIJF_VAN_VIJF = {
     "Natural Happiness nut mix Raw": True,
     # Beans
     "Bonduelle Chilibonen in saus": False,
-    "Hak  witten bonen in tomatensaus": False,
+    "Hak witte bonen in tomatensaus": False,
     "Heinz Beanz": False,
     "Smaakt Bio Zwarte Bonen": False,
     "Hak Bonen Bruine": False,
@@ -201,35 +199,25 @@ SCHIJF_VAN_VIJF = {
     "Ecoplaza Pastasaus sugo tradizionale": False,
 }
 
-# TESTING: set all to False
-for k in SCHIJF_VAN_VIJF:
-    SCHIJF_VAN_VIJF[k] = False
+# --- Coordinate math ---
 
 
 def get_real_coordinates(boxes_norm, orig_w, orig_h, model_dim=560):
     """
     boxes_norm: np.array of shape (N, 4) -> [cx, cy, w, h] (0-1 normalized)
+    Returns: np.array of shape (N, 4) -> [x1, y1, x2, y2] in original image coords
     """
-    # 1. Denormalize to the model's 560x560 frame
-    # We multiply by 560, NOT original_w/h yet
-    boxes_560 = boxes_norm * model_dim  # [cx, cy, w, h] in 560 pixels
+    boxes_px = boxes_norm * model_dim
 
-    # 2. Calculate the Padding and Scale used by ImageOps.pad
     scale = min(model_dim / orig_w, model_dim / orig_h)
     pad_x = (model_dim - orig_w * scale) / 2
     pad_y = (model_dim - orig_h * scale) / 2
 
-    # 3. Remove Padding (Shift) and Scale Back (Resize)
-    # Apply to Center X and Center Y
-    cx_real = (boxes_560[:, 0] - pad_x) / scale
-    cy_real = (boxes_560[:, 1] - pad_y) / scale
+    cx_real = (boxes_px[:, 0] - pad_x) / scale
+    cy_real = (boxes_px[:, 1] - pad_y) / scale
+    w_real = boxes_px[:, 2] / scale
+    h_real = boxes_px[:, 3] / scale
 
-    # Apply to Width and Height (only Scale, no shift)
-    w_real = boxes_560[:, 2] / scale
-    h_real = boxes_560[:, 3] / scale
-
-    # 4. Convert Center-Format [cx, cy, w, h] -> Corner-Format [x1, y1, x2, y2]
-    # Supervision expects [x1, y1, x2, y2]
     x1 = cx_real - (w_real / 2)
     y1 = cy_real - (h_real / 2)
     x2 = cx_real + (w_real / 2)
@@ -238,59 +226,48 @@ def get_real_coordinates(boxes_norm, orig_w, orig_h, model_dim=560):
     return np.stack([x1, y1, x2, y2], axis=1)
 
 
+# --- Inference ---
+
+
+def softmax(x):
+    e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
+
+
 def run_inference_sync(image_bytes, request_id, tracker):
-    """
-    Synchronous function to handle image decoding and inference.
-    This runs in a separate thread to keep the Websocket heartbeat alive.
-    """
-
-    def softmax(x):
-        e_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
-        return e_x / e_x.sum(axis=-1, keepdims=True)
-
     try:
-        # 1. Decode Image
+        # Decode
         npimg = np.frombuffer(image_bytes, np.uint8)
         img = jpeg.decode(npimg, flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
-
         if img is None:
             return {"error": "Failed to decode image"}
 
         original_h, original_w = img.shape[:2]
 
-        # 2. Preprocess
+        # Preprocess (pure numpy, no torch)
         img = Image.fromarray(img)
         img = ImageOps.pad(img, (model_w, model_h))
+        img_arr = np.asarray(img, dtype=np.float32) / 255.0
+        input_tensor = np.ascontiguousarray(
+            np.transpose(img_arr, (2, 0, 1))[np.newaxis, ...]
+        )
 
-        # (H,W,C) -> (C,H,W) -> (1,C,H,W)
-        img = torch.from_numpy(np.asarray(img)).float() / 255.0
-        img = img.permute((2, 0, 1))
-        input_tensor = img.unsqueeze(0)
-
-        # 3. Inference
+        # Inference
         start = perf_counter()
         raw_results = session.run(None, {input_name: input_tensor})
-        end = perf_counter()
+        inference_ms = (perf_counter() - start) * 1000
+        print(f"inference {inference_ms:.1f}ms")
 
-        inference_time = (end - start) * 1000
-        print(f"inference took {inference_time:.2f}ms")
-
-        # 4. Format Results (vectorized)
-        box_data = raw_results[output_map["dets"]]  # Shape: [1, N, 4]
-        score_data = raw_results[output_map["labels"]]  # Shape: [1, N, 61]
-
-        boxes = box_data[0]
-        logits = score_data[0]
+        # Post-process (vectorized)
+        boxes = raw_results[output_map["dets"]][0]  # (N, 4)
+        logits = raw_results[output_map["labels"]][0]  # (N, 61)
         probs = softmax(logits)
 
         num_queries = boxes.shape[0]
-        threshold = 0.5
-
-        # Vectorized filtering
         class_ids = np.argmax(probs, axis=1)
         scores = probs[np.arange(num_queries), class_ids]
 
-        valid_mask = (scores > threshold) & (class_ids < 60)
+        valid_mask = (scores > 0.35) & (class_ids < 60)
         mapped_ids = class_ids + 1
         has_mapping = np.array([int(mid) in CLASS_MAPPING for mid in mapped_ids])
         valid_mask = valid_mask & has_mapping
@@ -302,127 +279,91 @@ def run_inference_sync(image_bytes, request_id, tracker):
         if len(valid_boxes) == 0:
             return {"detections": [], "requestId": request_id}
 
-        # Convert to xyxy coordinates
-        xyxy = get_real_coordinates(valid_boxes, original_w, original_h, model_dim=model_w)
+        xyxy = get_real_coordinates(
+            valid_boxes, original_w, original_h, model_dim=model_w
+        )
 
-        # Run ByteTrack tracker
-        sv_detections = sv.Detections(
+        # ByteTrack
+        sv_dets = sv.Detections(
             xyxy=xyxy.astype(np.float32),
             confidence=valid_scores.astype(np.float32),
             class_id=valid_class_ids.astype(int),
         )
-        sv_detections = tracker.update(sv_detections)
+        sv_dets = tracker.update(sv_dets)
 
         # Build response
         detections = []
-        for i in range(len(sv_detections)):
-            mapped_id = int(sv_detections.class_id[i]) + 1
+        for i in range(len(sv_dets)):
+            mapped_id = int(sv_dets.class_id[i]) + 1
             class_name = CLASS_MAPPING[mapped_id]
-
-            x1, y1, x2, y2 = sv_detections.xyxy[i]
-            width_px = x2 - x1
-            height_px = y2 - y1
+            x1, y1, x2, y2 = sv_dets.xyxy[i]
 
             det = {
                 "class": class_name,
-                "confidence": float(sv_detections.confidence[i]),
+                "confidence": float(sv_dets.confidence[i]),
                 "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
-                "bbox": [float(x1), float(y1), float(width_px), float(height_px)],
+                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
             }
-
-            if sv_detections.tracker_id is not None:
-                det["tracker_id"] = int(sv_detections.tracker_id[i])
-
+            if sv_dets.tracker_id is not None:
+                det["tracker_id"] = int(sv_dets.tracker_id[i])
             detections.append(det)
 
         return {"detections": detections, "requestId": request_id}
 
     except Exception as e:
-        print(f"Inference Error: {e}")
+        print(f"Inference error: {e}")
         return {"error": str(e)}
 
 
+# --- WebSocket server ---
+
+
 async def inference_worker(websocket, queue, tracker):
-    """
-    Consumer: Pulls frames from queue and runs inference.
-    """
     while True:
-        # Get the next frame from the queue
         message = await queue.get()
-
         try:
-            if isinstance(message, bytes):
-                # Binary protocol: [4 bytes uint32 requestId BE] + [JPEG bytes]
-                request_id = int.from_bytes(message[:4], byteorder="big")
-                image_bytes = message[4:]
-            else:
-                # Legacy JSON/base64 fallback
-                data = json.loads(message)
-                request_id = data.get("requestId")
-                image_data = data["image"].split(",")[1]
-                image_bytes = base64.b64decode(image_data)
+            # Binary protocol: [4 bytes uint32 requestId BE] + [JPEG bytes]
+            request_id = int.from_bytes(message[:4], byteorder="big")
+            image_bytes = message[4:]
 
-            # Run inference in a separate thread so we don't block the event loop
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 executor, run_inference_sync, image_bytes, request_id, tracker
             )
-
-            # Send result back
             await websocket.send(json.dumps(response))
-
         except Exception as e:
-            print(f"Worker Error: {e}")
+            print(f"Worker error: {e}")
         finally:
             queue.task_done()
 
 
-async def detect_frame_handler(websocket):
-    """
-    Producer: Receives frames and puts them in a size-limited queue.
-    """
-    # Maxsize=1 ensures we only keep the LATEST frame.
-    # If the GPU is busy, we drop incoming frames.
-    queue = asyncio.Queue(maxsize=1)
-
-    # Per-connection tracker for persistent object IDs
+async def handler(websocket):
+    queue = asyncio.Queue(maxsize=10)
     tracker = ByteTrackTracker()
-
-    # Start the consumer task
     worker_task = asyncio.create_task(inference_worker(websocket, queue, tracker))
+    client = getattr(websocket, "remote_address", None)
+    print(f"Client connected: {client}")
 
     try:
         async for message in websocket:
             if queue.full():
-                # BUFFER STRATEGY: Drop the oldest frame (LIFO)
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
-
-            # Put the new frame in the queue
             await queue.put(message)
-
-    except websockets.exceptions.ConnectionClosed:
-        print("Client disconnected")
+    except websockets.exceptions.ConnectionClosed as e:
+        print(
+            f"Client disconnected: {client}, code={e.code}, reason={e.reason or 'none'}"
+        )
     finally:
-        # Clean up the worker when connection closes
         worker_task.cancel()
 
 
 async def main():
-    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-
-    try:
-        ssl_context.load_cert_chain(SSL_CERT_PATH, SSL_KEY_PATH)
-    except Exception as e:
-        print(f"Error loading certificates: {e}")
-        return
-
-    print(f"Starting secure server (WSS) on 0.0.0.0:5174...")
-
-    async with websockets.serve(detect_frame_handler, "0.0.0.0", 5174, ssl=ssl_context):
-        await asyncio.Future()  # run forever
+    print("Starting WebSocket server on 0.0.0.0:5174...")
+    async with websockets.serve(handler, "0.0.0.0", 5174):
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
