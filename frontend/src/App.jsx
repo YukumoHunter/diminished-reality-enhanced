@@ -3,8 +3,8 @@ import { renderEffects, EFFECT, OUTLINE } from './effects';
 import Settings from './Settings';
 
 const CAPTURE_LONGEST = 640;
-const SEND_TIMEOUT = 500;
-const MIN_SEND_INTERVAL = 30;
+const SEND_TIMEOUT = 30;
+const MIN_SEND_INTERVAL = 10;
 const JPEG_QUALITY = 0.7;
 
 function App() {
