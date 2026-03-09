@@ -140,11 +140,17 @@ function App() {
           const { w: cw, h: ch } = captureSize.current;
           const now = performance.now();
           if (cw > 0 && ch > 0 && now - lastSendAtRef.current >= MIN_SEND_INTERVAL) {
+            pendingRef.current = true;
+            lastSendAtRef.current = now;
+
             const cCtx = capCanvas.getContext('2d');
             cCtx.drawImage(video, 0, 0, cw, ch);
 
             capCanvas.toBlob((blob) => {
-              if (!blob || wsRef.current?.readyState !== WebSocket.OPEN) return;
+              if (!blob || wsRef.current?.readyState !== WebSocket.OPEN) {
+                pendingRef.current = false;
+                return;
+              }
 
               requestIdRef.current = (requestIdRef.current + 1) & 0xFFFFFFFF;
               const id = requestIdRef.current;
@@ -154,8 +160,6 @@ function App() {
                 new DataView(msg).setUint32(0, id, false);
                 new Uint8Array(msg, 4).set(new Uint8Array(buf));
                 wsRef.current?.send(msg);
-                pendingRef.current = true;
-                lastSendAtRef.current = performance.now();
 
                 // Timeout: unblock if server is slow
                 sendTimerRef.current = setTimeout(() => { pendingRef.current = false; }, SEND_TIMEOUT);
