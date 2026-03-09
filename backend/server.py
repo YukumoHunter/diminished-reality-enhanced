@@ -199,6 +199,14 @@ SCHIJF_VAN_VIJF = {
     "Ecoplaza Pastasaus sugo tradizionale": False,
 }
 
+NUM_PRODUCT_CLASSES = len(CLASS_MAPPING)
+MIN_TRACKING_SCORE = 0.2
+TRACK_ACTIVATION_SCORE = 0.5
+TRACK_HIGH_CONF_SCORE = 0.5
+TRACK_HOLD_FRAMES = 3
+TRACK_MEMORY_TTL_FRAMES = 30
+CLASS_VOTE_DECAY = 0.8
+
 # --- Coordinate math ---
 
 
@@ -234,7 +242,101 @@ def softmax(x):
     return e_x / e_x.sum(axis=-1, keepdims=True)
 
 
-def run_inference_sync(image_bytes, request_id, tracker):
+def build_detection(xyxy, class_id, confidence, tracker_id=None):
+    mapped_id = int(class_id) + 1
+    class_name = CLASS_MAPPING[mapped_id]
+    x1, y1, x2, y2 = xyxy
+
+    det = {
+        "class": class_name,
+        "confidence": float(confidence),
+        "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
+        "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+    }
+    if tracker_id is not None:
+        det["tracker_id"] = int(tracker_id)
+    return det
+
+
+def get_track_state(track_memory, track_id):
+    state = track_memory.get(track_id)
+    if state is None:
+        state = {
+            "bbox": None,
+            "confidence": 0.0,
+            "miss_count": 0,
+            "stable_class_id": None,
+            "class_votes": np.zeros(NUM_PRODUCT_CLASSES, dtype=np.float32),
+        }
+        track_memory[track_id] = state
+    return state
+
+
+def build_stable_detections(sv_dets, track_memory):
+    detections = []
+    seen_track_ids = set()
+
+    for i in range(len(sv_dets)):
+        track_id = None
+        if sv_dets.tracker_id is not None:
+            track_id = int(sv_dets.tracker_id[i])
+
+        # Ignore tentative tracks until ByteTrack confirms them with a real ID.
+        if track_id is None or track_id < 0:
+            continue
+
+        seen_track_ids.add(track_id)
+        state = get_track_state(track_memory, track_id)
+        class_id = int(sv_dets.class_id[i])
+        confidence = float(sv_dets.confidence[i])
+        bbox = sv_dets.xyxy[i].astype(np.float32).copy()
+
+        state["class_votes"] *= CLASS_VOTE_DECAY
+        state["class_votes"][class_id] += confidence
+        state["stable_class_id"] = int(np.argmax(state["class_votes"]))
+        state["bbox"] = bbox
+        state["confidence"] = confidence
+        state["miss_count"] = 0
+
+        detections.append(
+            build_detection(
+                bbox,
+                state["stable_class_id"],
+                confidence,
+                tracker_id=track_id,
+            )
+        )
+
+    stale_track_ids = []
+    for track_id, state in list(track_memory.items()):
+        if track_id in seen_track_ids:
+            continue
+
+        state["miss_count"] += 1
+        if (
+            state["miss_count"] <= TRACK_HOLD_FRAMES
+            and state["bbox"] is not None
+            and state["stable_class_id"] is not None
+        ):
+            detections.append(
+                build_detection(
+                    state["bbox"],
+                    state["stable_class_id"],
+                    state["confidence"],
+                    tracker_id=track_id,
+                )
+            )
+
+        if state["miss_count"] > TRACK_MEMORY_TTL_FRAMES:
+            stale_track_ids.append(track_id)
+
+    for track_id in stale_track_ids:
+        del track_memory[track_id]
+
+    return detections
+
+
+def run_inference_sync(image_bytes, request_id, tracker, track_memory):
     try:
         # Decode
         npimg = np.frombuffer(image_bytes, np.uint8)
@@ -267,7 +369,7 @@ def run_inference_sync(image_bytes, request_id, tracker):
         class_ids = np.argmax(probs, axis=1)
         scores = probs[np.arange(num_queries), class_ids]
 
-        valid_mask = (scores > 0.35) & (class_ids < 60)
+        valid_mask = (scores > MIN_TRACKING_SCORE) & (class_ids < NUM_PRODUCT_CLASSES)
         mapped_ids = class_ids + 1
         has_mapping = np.array([int(mid) in CLASS_MAPPING for mid in mapped_ids])
         valid_mask = valid_mask & has_mapping
@@ -277,36 +379,21 @@ def run_inference_sync(image_bytes, request_id, tracker):
         valid_class_ids = class_ids[valid_mask]
 
         if len(valid_boxes) == 0:
-            return {"detections": [], "requestId": request_id}
+            sv_dets = tracker.update(sv.Detections.empty())
+        else:
+            xyxy = get_real_coordinates(
+                valid_boxes, original_w, original_h, model_dim=model_w
+            )
 
-        xyxy = get_real_coordinates(
-            valid_boxes, original_w, original_h, model_dim=model_w
-        )
+            # ByteTrack
+            sv_dets = sv.Detections(
+                xyxy=xyxy.astype(np.float32),
+                confidence=valid_scores.astype(np.float32),
+                class_id=valid_class_ids.astype(int),
+            )
+            sv_dets = tracker.update(sv_dets)
 
-        # ByteTrack
-        sv_dets = sv.Detections(
-            xyxy=xyxy.astype(np.float32),
-            confidence=valid_scores.astype(np.float32),
-            class_id=valid_class_ids.astype(int),
-        )
-        sv_dets = tracker.update(sv_dets)
-
-        # Build response
-        detections = []
-        for i in range(len(sv_dets)):
-            mapped_id = int(sv_dets.class_id[i]) + 1
-            class_name = CLASS_MAPPING[mapped_id]
-            x1, y1, x2, y2 = sv_dets.xyxy[i]
-
-            det = {
-                "class": class_name,
-                "confidence": float(sv_dets.confidence[i]),
-                "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
-                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
-            }
-            if sv_dets.tracker_id is not None:
-                det["tracker_id"] = int(sv_dets.tracker_id[i])
-            detections.append(det)
+        detections = build_stable_detections(sv_dets, track_memory)
 
         return {"detections": detections, "requestId": request_id}
 
@@ -318,7 +405,7 @@ def run_inference_sync(image_bytes, request_id, tracker):
 # --- WebSocket server ---
 
 
-async def inference_worker(websocket, queue, tracker):
+async def inference_worker(websocket, queue, tracker, track_memory):
     while True:
         message = await queue.get()
         try:
@@ -328,7 +415,12 @@ async def inference_worker(websocket, queue, tracker):
 
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
-                executor, run_inference_sync, image_bytes, request_id, tracker
+                executor,
+                run_inference_sync,
+                image_bytes,
+                request_id,
+                tracker,
+                track_memory,
             )
             await websocket.send(json.dumps(response))
         except Exception as e:
@@ -339,8 +431,15 @@ async def inference_worker(websocket, queue, tracker):
 
 async def handler(websocket):
     queue = asyncio.Queue(maxsize=10)
-    tracker = ByteTrackTracker()
-    worker_task = asyncio.create_task(inference_worker(websocket, queue, tracker))
+    tracker = ByteTrackTracker(
+        track_activation_threshold=TRACK_ACTIVATION_SCORE,
+        high_conf_det_threshold=TRACK_HIGH_CONF_SCORE,
+        minimum_consecutive_frames=1,
+    )
+    track_memory = {}
+    worker_task = asyncio.create_task(
+        inference_worker(websocket, queue, tracker, track_memory)
+    )
     client = getattr(websocket, "remote_address", None)
     print(f"Client connected: {client}")
 

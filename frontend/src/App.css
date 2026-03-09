@@ -43,31 +43,34 @@ video {
   z-index: 10;
   display: flex;
   justify-content: space-between;
-  padding: max(env(safe-area-inset-top, 12px), 12px) 12px 0;
+  padding: max(env(safe-area-inset-top, 16px), 16px) 16px 0;
 }
 
 .ctrl-btn {
-  width: 48px;
-  height: 48px;
+  width: 60px;
+  height: 60px;
   border: none;
-  border-radius: 12px;
-  background: rgba(0, 0, 0, 0.35);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.42);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
-  color: rgba(255, 255, 255, 0.85);
+  color: rgba(255, 255, 255, 0.92);
   cursor: pointer;
   display: grid;
   place-items: center;
-  transition: background 0.15s;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.2);
+  transition: background 0.15s, transform 0.15s;
+  touch-action: manipulation;
 }
 
 .ctrl-btn:active {
   background: rgba(0, 0, 0, 0.55);
+  transform: scale(0.98);
 }
 
 .ctrl-btn svg {
-  width: 24px;
-  height: 24px;
+  width: 30px;
+  height: 30px;
 }
 
 .status-dot {
@@ -87,12 +90,12 @@ video {
 
 @media (min-width: 768px) {
   .ctrl-btn {
-    width: 44px;
-    height: 44px;
+    width: 56px;
+    height: 56px;
   }
 
   .ctrl-btn svg {
-    width: 22px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
   }
 }
