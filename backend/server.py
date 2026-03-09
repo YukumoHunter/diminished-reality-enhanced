@@ -338,11 +338,15 @@ def build_stable_detections(sv_dets, track_memory):
 
 def run_inference_sync(image_bytes, request_id, tracker, track_memory):
     try:
+        t0 = perf_counter()
+
         # Decode
         npimg = np.frombuffer(image_bytes, np.uint8)
         img = jpeg.decode(npimg, flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
         if img is None:
             return {"error": "Failed to decode image"}
+
+        t_decode = perf_counter()
 
         original_h, original_w = img.shape[:2]
 
@@ -354,11 +358,11 @@ def run_inference_sync(image_bytes, request_id, tracker, track_memory):
             np.transpose(img_arr, (2, 0, 1))[np.newaxis, ...]
         )
 
+        t_preprocess = perf_counter()
+
         # Inference
-        start = perf_counter()
         raw_results = session.run(None, {input_name: input_tensor})
-        inference_ms = (perf_counter() - start) * 1000
-        print(f"inference {inference_ms:.1f}ms")
+        t_inference = perf_counter()
 
         # Post-process (vectorized)
         boxes = raw_results[output_map["dets"]][0]  # (N, 4)
@@ -394,6 +398,14 @@ def run_inference_sync(image_bytes, request_id, tracker, track_memory):
             sv_dets = tracker.update(sv_dets)
 
         detections = build_stable_detections(sv_dets, track_memory)
+        t_postprocess = perf_counter()
+
+        decode_ms = (t_decode - t0) * 1000
+        preprocess_ms = (t_preprocess - t_decode) * 1000
+        inference_ms = (t_inference - t_preprocess) * 1000
+        postprocess_ms = (t_postprocess - t_inference) * 1000
+        total_ms = (t_postprocess - t0) * 1000
+        print(f"[req {request_id}] decode={decode_ms:.1f}ms preprocess={preprocess_ms:.1f}ms inference={inference_ms:.1f}ms postprocess={postprocess_ms:.1f}ms total={total_ms:.1f}ms")
 
         return {"detections": detections, "requestId": request_id}
 
@@ -406,8 +418,11 @@ def run_inference_sync(image_bytes, request_id, tracker, track_memory):
 
 
 async def inference_worker(websocket, queue, tracker, track_memory):
+    last_done = perf_counter()
     while True:
+        t_wait_start = perf_counter()
         message = await queue.get()
+        t_got = perf_counter()
         try:
             # Binary protocol: [4 bytes uint32 requestId BE] + [JPEG bytes]
             request_id = int.from_bytes(message[:4], byteorder="big")
@@ -422,15 +437,25 @@ async def inference_worker(websocket, queue, tracker, track_memory):
                 tracker,
                 track_memory,
             )
+            t_inferred = perf_counter()
             await websocket.send(json.dumps(response))
+            t_sent = perf_counter()
+
+            idle_ms = (t_got - last_done) * 1000
+            queue_ms = (t_got - t_wait_start) * 1000
+            send_ms = (t_sent - t_inferred) * 1000
+            round_ms = (t_sent - t_got) * 1000
+            print(f"[req {request_id}] idle={idle_ms:.1f}ms queue_wait={queue_ms:.1f}ms send={send_ms:.1f}ms round_trip={round_ms:.1f}ms")
+            last_done = t_sent
         except Exception as e:
             print(f"Worker error: {e}")
+            last_done = perf_counter()
         finally:
             queue.task_done()
 
 
 async def handler(websocket):
-    queue = asyncio.Queue(maxsize=10)
+    queue = asyncio.Queue(maxsize=1)
     tracker = ByteTrackTracker(
         track_activation_threshold=TRACK_ACTIVATION_SCORE,
         high_conf_det_threshold=TRACK_HIGH_CONF_SCORE,
