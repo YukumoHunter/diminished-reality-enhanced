@@ -70,4 +70,4 @@ No test framework is configured in either package.
 
 ## Model
 
-`backend/model/model.onnx` (~130 MB) is not tracked in git. The model is a DETR-based detector with 60 product classes + background (61 output channels). Place it at `backend/model/model.onnx`.
+`backend/model/model.onnx` (~130 MB) is tracked via Git LFS. Run `git lfs pull` after cloning if the model contents have not been downloaded yet. The model is a DETR-based detector with 60 product classes + background (61 output channels).

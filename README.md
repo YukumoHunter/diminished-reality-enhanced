@@ -7,11 +7,13 @@ Mobile web app that detects grocery items in real time and visually de-emphasize
 - `pnpm`
 - `uv`
 - `Python 3.11+`
-- `backend/model/model.onnx`
+- `git-lfs`
 
 ## Install
 
 ```bash
+git lfs install
+
 cd frontend
 pnpm install
 
@@ -19,7 +21,13 @@ cd ../backend
 uv sync
 ```
 
-Place the ONNX model at `backend/model/model.onnx`.
+The ONNX model is tracked in Git LFS at `backend/model/model.onnx`.
+
+After cloning, fetch LFS objects if the model has not been downloaded yet:
+
+```bash
+git lfs pull
+```
 
 ## Run
 
