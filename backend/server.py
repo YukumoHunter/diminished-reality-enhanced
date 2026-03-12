@@ -220,7 +220,7 @@ def save_overrides(overrides):
 health_overrides = load_overrides()
 
 NUM_PRODUCT_CLASSES = len(CLASS_MAPPING)
-MIN_TRACKING_SCORE = 0.2
+MIN_TRACKING_SCORE = 0.25
 TRACK_ACTIVATION_SCORE = 0.5
 TRACK_HIGH_CONF_SCORE = 0.5
 TRACK_HOLD_FRAMES = 3
@@ -483,7 +483,9 @@ async def handler(websocket):
                         print(f"Settings saved: {len(overrides)} overrides")
                     elif data.get("type") == "get_settings":
                         await websocket.send(
-                            json.dumps({"type": "settings", "overrides": health_overrides})
+                            json.dumps(
+                                {"type": "settings", "overrides": health_overrides}
+                            )
                         )
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"Settings error: {e}")
