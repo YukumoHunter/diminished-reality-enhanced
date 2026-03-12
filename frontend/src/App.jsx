@@ -35,6 +35,18 @@ function App() {
     settingsRef.current = { effect, outlineMode, outlineColor, classOverrides };
   }, [effect, outlineMode, outlineColor, classOverrides]);
 
+  // Send overrides to backend when user changes them
+  const skipNextSyncRef = useRef(false);
+  const mountedRef = useRef(false);
+  useEffect(() => {
+    if (!mountedRef.current) { mountedRef.current = true; return; }
+    if (skipNextSyncRef.current) { skipNextSyncRef.current = false; return; }
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'save_settings', overrides: classOverrides }));
+    }
+  }, [classOverrides]);
+
   // --- Camera ---
   useEffect(() => {
     let stream = null;
@@ -86,6 +98,8 @@ function App() {
       ws.onopen = () => {
         console.log('WS open');
         setConnected(true);
+        // Request saved overrides from backend
+        ws.send(JSON.stringify({ type: 'get_settings' }));
       };
       ws.onclose = (event) => {
         console.log('WS close', { code: event.code, reason: event.reason });
@@ -102,6 +116,14 @@ function App() {
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);
+          if (data.type === 'settings') {
+            // Load saved overrides from backend without echoing back
+            if (data.overrides) {
+              skipNextSyncRef.current = true;
+              setClassOverrides(data.overrides);
+            }
+            return;
+          }
           detectionsRef.current = data.detections || [];
         } catch (e) {
           console.error('WS message error:', e);

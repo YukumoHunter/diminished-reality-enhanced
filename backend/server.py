@@ -199,6 +199,26 @@ SCHIJF_VAN_VIJF = {
     "Ecoplaza Pastasaus sugo tradizionale": False,
 }
 
+# --- Shared settings (overrides persisted to disk) ---
+
+SETTINGS_FILE = pathlib.Path(__file__).parent / "settings.json"
+
+
+def load_overrides():
+    try:
+        data = json.loads(SETTINGS_FILE.read_text())
+        return data.get("overrides", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_overrides(overrides):
+    SETTINGS_FILE.write_text(json.dumps({"overrides": overrides}, indent=2))
+
+
+# Global overrides dict (product_name -> bool), applied on top of SCHIJF_VAN_VIJF
+health_overrides = load_overrides()
+
 NUM_PRODUCT_CLASSES = len(CLASS_MAPPING)
 MIN_TRACKING_SCORE = 0.2
 TRACK_ACTIVATION_SCORE = 0.5
@@ -247,10 +267,16 @@ def build_detection(xyxy, class_id, confidence, tracker_id=None):
     class_name = CLASS_MAPPING[mapped_id]
     x1, y1, x2, y2 = xyxy
 
+    # Apply user overrides on top of default health data
+    if class_name in health_overrides:
+        healthy = health_overrides[class_name]
+    else:
+        healthy = SCHIJF_VAN_VIJF.get(class_name, True)
+
     det = {
         "class": class_name,
         "confidence": float(confidence),
-        "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
+        "in_schijf_van_vijf": healthy,
         "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
     }
     if tracker_id is not None:
@@ -445,6 +471,25 @@ async def handler(websocket):
 
     try:
         async for message in websocket:
+            # Text messages are settings commands
+            if isinstance(message, str):
+                try:
+                    data = json.loads(message)
+                    if data.get("type") == "save_settings":
+                        overrides = data.get("overrides", {})
+                        health_overrides.clear()
+                        health_overrides.update(overrides)
+                        save_overrides(overrides)
+                        print(f"Settings saved: {len(overrides)} overrides")
+                    elif data.get("type") == "get_settings":
+                        await websocket.send(
+                            json.dumps({"type": "settings", "overrides": health_overrides})
+                        )
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Settings error: {e}")
+                continue
+
+            # Binary messages are image frames
             if queue.full():
                 try:
                     queue.get_nowait()
