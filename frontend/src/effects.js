@@ -3,7 +3,39 @@ export const OUTLINE = { OFF: 0, HEALTHY: 1, ALL: 2 };
 
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
+function createWorkingCanvas(width, height) {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    return new OffscreenCanvas(width, height);
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
 // --- Coordinate transform: capture coords → display coords (object-fit: cover) ---
+
+function getCoverCrop(videoW, videoH, displayW, displayH) {
+  const displayAR = displayW / displayH;
+  const videoAR = videoW / videoH;
+
+  if (videoAR > displayAR) {
+    return {
+      sx: (videoW - videoH * displayAR) / 2,
+      sy: 0,
+      sw: videoH * displayAR,
+      sh: videoH,
+    };
+  }
+
+  return {
+    sx: 0,
+    sy: (videoH - videoW / displayAR) / 2,
+    sw: videoW,
+    sh: videoW / displayAR,
+  };
+}
 
 function captureToDisplay(bbox, captureW, captureH, videoW, videoH, displayW, displayH) {
   // 1. Capture → native video coords
@@ -16,22 +48,7 @@ function captureToDisplay(bbox, captureW, captureH, videoW, videoH, displayW, di
   h *= scaleY;
 
   // 2. Compute object-fit: cover crop rect in native video coords
-  const displayAR = displayW / displayH;
-  const videoAR = videoW / videoH;
-  let sx, sy, sw, sh;
-  if (videoAR > displayAR) {
-    // Video wider than display — crop sides
-    sh = videoH;
-    sw = videoH * displayAR;
-    sx = (videoW - sw) / 2;
-    sy = 0;
-  } else {
-    // Video taller than display — crop top/bottom
-    sw = videoW;
-    sh = videoW / displayAR;
-    sx = 0;
-    sy = (videoH - sh) / 2;
-  }
+  const { sx, sy, sw, sh } = getCoverCrop(videoW, videoH, displayW, displayH);
 
   // 3. Native → display
   const dx = (x - sx) * (displayW / sw);
@@ -78,32 +95,50 @@ function manualDesaturate(imageData, strength) {
 
 // --- Effect applicators ---
 
+function displayToVideoRect(x, y, w, h, videoW, videoH, displayW, displayH) {
+  const { sx, sy, sw, sh } = getCoverCrop(videoW, videoH, displayW, displayH);
+
+  return [
+    sx + (x * sw) / displayW,
+    sy + (y * sh) / displayH,
+    (w * sw) / displayW,
+    (h * sh) / displayH,
+  ];
+}
+
 function applyBlur(ctx, video, x, y, w, h, strength) {
   if (strength <= 0) return;
-  const ix = Math.max(0, Math.round(x));
-  const iy = Math.max(0, Math.round(y));
-  const iw = Math.round(w);
-  const ih = Math.round(h);
+  const ix = Math.max(0, Math.floor(x));
+  const iy = Math.max(0, Math.floor(y));
+  const iw = Math.min(ctx.canvas.width - ix, Math.ceil(w));
+  const ih = Math.min(ctx.canvas.height - iy, Math.ceil(h));
   if (iw <= 0 || ih <= 0) return;
 
+  // Sample past the detection bounds so the blur stays full-strength up to the edge.
+  const pad = Math.max(2, Math.ceil(strength * 2));
+  const ex = Math.max(0, ix - pad);
+  const ey = Math.max(0, iy - pad);
+  const ex2 = Math.min(ctx.canvas.width, ix + iw + pad);
+  const ey2 = Math.min(ctx.canvas.height, iy + ih + pad);
+  const ew = ex2 - ex;
+  const eh = ey2 - ey;
+  const [sx, sy, sw, sh] = displayToVideoRect(
+    ex, ey, ew, eh, video.videoWidth, video.videoHeight, ctx.canvas.width, ctx.canvas.height
+  );
+  const off = createWorkingCanvas(ew, eh);
+  const oc = off.getContext('2d');
+
   if (isIOS) {
-    const off = new OffscreenCanvas(iw, ih);
-    const oc = off.getContext('2d');
-    oc.drawImage(ctx.canvas, ix, iy, iw, ih, 0, 0, iw, ih);
-    const imgData = oc.getImageData(0, 0, iw, ih);
+    oc.drawImage(video, sx, sy, sw, sh, 0, 0, ew, eh);
+    const imgData = oc.getImageData(0, 0, ew, eh);
     manualBlur(imgData, Math.min(strength, 8));
     oc.putImageData(imgData, 0, 0);
-    ctx.drawImage(off, ix, iy);
   } else {
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(ix, iy, iw, ih);
-    ctx.clip();
-    ctx.filter = `blur(${strength}px)`;
-    ctx.drawImage(video, 0, 0, video.videoWidth, video.videoHeight,
-                  0, 0, ctx.canvas.width, ctx.canvas.height);
-    ctx.restore();
+    oc.filter = `blur(${strength}px)`;
+    oc.drawImage(video, sx, sy, sw, sh, 0, 0, ew, eh);
   }
+
+  ctx.drawImage(off, ix - ex, iy - ey, iw, ih, ix, iy, iw, ih);
 }
 
 function applyOverlay(ctx, x, y, w, h, opacity) {
@@ -151,7 +186,7 @@ function drawOutline(ctx, x, y, w, h, color) {
 
 // --- Strength maps ---
 
-const EFFECT_STRENGTH = {
+export const EFFECT_STRENGTH = {
   [EFFECT.NONE]: 0,
   [EFFECT.BLUR]: 20,
   [EFFECT.OVERLAY]: 1,
@@ -160,27 +195,39 @@ const EFFECT_STRENGTH = {
 
 // --- Main render function ---
 
-export function renderEffects(canvas, video, detections, effectType, outlineMode, outlineColor, classOverrides, captureW, captureH) {
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+export function prepareRenderDetections(
+  detections, classOverrides, captureW, captureH, videoW, videoH, displayW, displayH
+) {
+  if (!videoW || !videoH || !captureW || !captureH || !displayW || !displayH) {
+    return [];
+  }
 
-  const displayW = canvas.width;
-  const displayH = canvas.height;
-  const videoW = video.videoWidth;
-  const videoH = video.videoHeight;
-
-  if (!videoW || !videoH || !captureW || !captureH) return;
-
-  for (const det of detections) {
+  return detections.map((det) => {
     const isHealthy = classOverrides[det.class] !== undefined
       ? classOverrides[det.class]
       : det.in_schijf_van_vijf;
-
-    const [dx, dy, dw, dh] = captureToDisplay(
+    const [x, y, w, h] = captureToDisplay(
       det.bbox, captureW, captureH, videoW, videoH, displayW, displayH
     );
 
-    const opacity = det.opacity ?? 1;
+    return {
+      ...det,
+      isHealthy,
+      opacity: det.opacity ?? 1,
+      x,
+      y,
+      w,
+      h,
+    };
+  });
+}
+
+export function renderEffects(canvas, video, detections, effectType, outlineMode, outlineColor) {
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  for (const det of detections) {
+    const { isHealthy, opacity, x, y, w, h } = det;
 
     // Outline
     if (outlineMode === OUTLINE.ALL || (outlineMode === OUTLINE.HEALTHY && isHealthy)) {
@@ -188,7 +235,7 @@ export function renderEffects(canvas, video, detections, effectType, outlineMode
         ? (isHealthy ? '#22c55e' : '#ef4444')
         : outlineColor;
       ctx.globalAlpha = opacity;
-      drawOutline(ctx, dx, dy, dw, dh, oColor);
+      drawOutline(ctx, x, y, w, h, oColor);
       ctx.globalAlpha = 1;
     }
 
@@ -197,13 +244,13 @@ export function renderEffects(canvas, video, detections, effectType, outlineMode
       const strength = EFFECT_STRENGTH[effectType] * opacity;
       switch (effectType) {
         case EFFECT.BLUR:
-          applyBlur(ctx, video, dx, dy, dw, dh, strength);
+          applyBlur(ctx, video, x, y, w, h, strength);
           break;
         case EFFECT.OVERLAY:
-          applyOverlay(ctx, dx, dy, dw, dh, strength);
+          applyOverlay(ctx, x, y, w, h, strength);
           break;
         case EFFECT.DESATURATE:
-          applyDesaturate(ctx, video, dx, dy, dw, dh, strength);
+          applyDesaturate(ctx, video, x, y, w, h, strength);
           break;
       }
     }

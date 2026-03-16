@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { renderEffects, EFFECT, OUTLINE } from './effects';
+import { prepareRenderDetections, renderEffects, EFFECT, EFFECT_STRENGTH, OUTLINE } from './effects';
 import Settings from './Settings';
 
 const CAPTURE_LONGEST = 640;
@@ -7,11 +7,48 @@ const SEND_TIMEOUT = 30;
 const MIN_SEND_INTERVAL = 10;
 const JPEG_QUALITY = 0.7;
 
+function supportsNativeBlur() {
+  return typeof CSS !== 'undefined' && typeof CSS.supports === 'function' && (
+    CSS.supports('backdrop-filter', 'blur(1px)') ||
+    CSS.supports('-webkit-backdrop-filter', 'blur(1px)')
+  );
+}
+
+function syncNativeBlurLayer(layer, detections) {
+  if (!layer) return;
+
+  while (layer.childElementCount > detections.length) {
+    layer.lastElementChild.remove();
+  }
+
+  while (layer.childElementCount < detections.length) {
+    const box = document.createElement('div');
+    box.className = 'native-blur-box';
+    layer.appendChild(box);
+  }
+
+  layer.style.display = detections.length ? 'block' : 'none';
+
+  for (let i = 0; i < detections.length; i++) {
+    const det = detections[i];
+    const box = layer.children[i];
+    const blur = `blur(${Math.max(0, EFFECT_STRENGTH[EFFECT.BLUR] * det.opacity)}px)`;
+
+    box.style.transform = `translate3d(${det.x}px, ${det.y}px, 0)`;
+    box.style.width = `${det.w}px`;
+    box.style.height = `${det.h}px`;
+    box.style.opacity = `${det.opacity}`;
+    box.style.backdropFilter = blur;
+    box.style.webkitBackdropFilter = blur;
+  }
+}
+
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const captureCanvasRef = useRef(null);
   const containerRef = useRef(null);
+  const blurLayerRef = useRef(null);
 
   const [connected, setConnected] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -29,6 +66,7 @@ function App() {
   const sendTimerRef = useRef(null);
   const requestIdRef = useRef(0);
   const lastSendAtRef = useRef(0);
+  const nativeBlurSupportedRef = useRef(supportsNativeBlur());
 
   // Sync settings to ref
   useEffect(() => {
@@ -150,6 +188,7 @@ function App() {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const capCanvas = captureCanvasRef.current;
+      const blurLayer = blurLayerRef.current;
 
       if (video && canvas && video.readyState >= 2) {
         // Match canvas to display size
@@ -192,10 +231,32 @@ function App() {
 
         // Render effects
         const s = settingsRef.current;
+        const renderDetections = prepareRenderDetections(
+          detectionsRef.current,
+          s.classOverrides,
+          captureSize.current.w,
+          captureSize.current.h,
+          video.videoWidth,
+          video.videoHeight,
+          rect.width,
+          rect.height
+        );
+        const useNativeBlur = nativeBlurSupportedRef.current && s.effect === EFFECT.BLUR;
+
+        syncNativeBlurLayer(
+          blurLayer,
+          useNativeBlur
+            ? renderDetections.filter((det) => !det.isHealthy && det.opacity > 0 && det.w > 0 && det.h > 0)
+            : []
+        );
+
         renderEffects(
-          canvas, video, detectionsRef.current,
-          s.effect, s.outlineMode, s.outlineColor, s.classOverrides,
-          captureSize.current.w, captureSize.current.h
+          canvas,
+          video,
+          renderDetections,
+          useNativeBlur ? EFFECT.NONE : s.effect,
+          s.outlineMode,
+          s.outlineColor
         );
       }
 
@@ -228,6 +289,7 @@ function App() {
         autoPlay
         onLoadedMetadata={onVideoReady}
       />
+      <div ref={blurLayerRef} className="native-blur-layer" />
       <canvas ref={canvasRef} className="overlay-canvas" />
       <canvas ref={captureCanvasRef} style={{ display: 'none' }} />
 
