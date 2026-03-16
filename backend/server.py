@@ -1,42 +1,43 @@
 import asyncio
+import argparse
 import json
 import os
 import pathlib
+from collections import deque
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
 import numpy as np
-import onnxruntime as ort
 import supervision as sv
 import websockets
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw
+from rfdetr import RFDETRMedium
 from trackers import ByteTrackTracker
-from turbojpeg import TurboJPEG, TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE
+from turbojpeg import TJFLAG_FASTDCT, TJFLAG_FASTUPSAMPLE, TJPF_RGB, TurboJPEG
+from torch.jit import TracerWarning
 
-# --- ONNX Model ---
+warnings.filterwarnings("ignore", category=TracerWarning)
 
-providers = [
-    (
-        "TensorrtExecutionProvider",
-        {
-            "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": ".",
-            "trt_fp16_enable": True,
-        },
-    ),
-    "CUDAExecutionProvider",
-]
+# --- RF-DETR Model ---
 
-print("Loading model/model.onnx...")
-session = ort.InferenceSession("model/model.onnx", providers=providers)
+MODEL_WEIGHTS = pathlib.Path(__file__).parent / "model" / "checkpoint_best_total.pth"
+model_h = 576
+model_w = 576
 
-input_name = session.get_inputs()[0].name
-input_shape = session.get_inputs()[0].shape
-model_h, model_w = input_shape[2], input_shape[3]
 
-output_map = {}
-for i, node in enumerate(session.get_outputs()):
-    output_map[node.name] = i
+def load_model():
+    # kwargs = {
+    #     "num_classes": 60,
+    #     "resolution": model_w,
+    # }
+    # return RFDETRMedium(pretrain_weights=str(MODEL_WEIGHTS), **kwargs)
+    return RFDETRMedium(pretrain_weights=str(MODEL_WEIGHTS))
+
+
+print(f"Loading {MODEL_WEIGHTS}...")
+model = load_model()
+model.optimize_for_inference()
 
 # --- TurboJPEG ---
 
@@ -48,12 +49,14 @@ else:
 # --- Thread pool ---
 
 executor = ThreadPoolExecutor(max_workers=1)
+save_history_dir = None
+save_history_slots = deque()
 
 # --- Warmup ---
 
 dummy_input = np.zeros((1, 3, model_h, model_w), dtype=np.float32)
 try:
-    session.run(None, {input_name: dummy_input})
+    model.predict(Image.fromarray(np.zeros((model_h, model_w, 3), dtype=np.uint8)))
     print("Model warmup complete.")
 except Exception as e:
     print(f"Warmup failed: {e}")
@@ -61,66 +64,66 @@ except Exception as e:
 # --- Class & health data ---
 
 CLASS_MAPPING = {
-    1: "AH Rode linzen penne",
-    2: "Jumbo Sojadrink Naturel",
-    3: "Jumbo Haverdrink Naturel",
+    1: "AH Biologisch Penne",
+    2: "AH Biologisch Smeuïge pindakaas met stukjes pinda",
+    3: "AH Biologisch Stevige crackers kaas",
     4: "AH Cranberry notenmix ongezouten",
-    5: "La bioidea Penne",
-    6: "Heinz Beanz",
-    7: "Ekoplaza Volkoren penne",
-    8: "Bonne Maman Pindapasta romig",
-    9: "Smaakt Bio Zwarte Bonen",
-    10: "Jumbo Organic Whole Wheat Rigatoni",
-    11: "AH Dunne crackers kaas",
-    12: "Jumbo Hollandse Bruine Bonen",
-    13: "AH Biologisch Smeuïge pindakaas met stukjes pinda",
-    14: "Hak Bonen Bruine",
-    15: "Freshona Linzen Lentils lidl",
-    16: "Oatly! Organic oat drink",
-    17: "Natural Happiness nut mix Raw",
-    18: "Grand' Italia Penne tradizionali",
+    5: "AH Dunne crackers kaas",
+    6: "AH Dunne crackers volkoren",
+    7: "AH Rode linzen penne",
+    8: "AH Stevige crackers waldkorn",
+    9: "AH Terra Elitehaver ongebrand",
+    10: "AH Terra Jonge kapucijners",
+    11: "AH Terra Noten cranberry rozijn mix ongebrand",
+    12: "AH Terra Plantaardig biologisch 100% pindakaas",
+    13: "AH Terra Plantaardige erwtendrink ongezoet",
+    14: "AH Terra Plantaardige haverdrink ongezoet",
+    15: "AH Terra Plantaardige sojadrink",
+    16: "Alesto Noten mix",
+    17: "Alpro Barista soja",
+    18: "Alpro Haverdrink zonder suikers",
     19: "Alpro Sojadrink Houdbaar",
-    20: "Whole earth Drizzler golden roasted peanut butter",
+    20: "BioToday Peanutbutter crunchy bio",
     21: "Bolletje Low carb groentecrackers paprika",
-    22: "Duyvis Oven baked peanuts honey salt",
-    23: "AH Terra Plantaardige haverdrink ongezoet",
-    24: "AH Terra Jonge kapucijners",
-    25: "Rummo Volkoren Biologische Penne Rigate",
-    26: "AH Dunne crackers volkoren",
-    27: "Rude Health Barista soja",
-    28: "Jumbo's 100% Biologische Pindakaas Naturel",
-    29: "Jumbo Groentecrackers Wortel & Zoete Aardappel",
-    30: "AH Terra Plantaardige sojadrink",
-    31: "BioToday Peanutbutter crunchy bio",
-    32: "Luna E Terra Pindakaas Smooth Bio",
-    33: "AH Terra Plantaardige erwtendrink ongezoet",
-    34: "Bolletje Oerknack Waldkorn",
-    35: "AH Terra Plantaardig biologisch 100% pindakaas",
-    36: "AH Biologisch Stevige crackers kaas",
-    37: "Alpro Haverdrink zonder suikers",
-    38: "Jumbo Penne Rigate Whole Wheat",
-    39: "Jumbo's 100% Natural Peanut Butter",
-    40: "Hak Kapucijners",
-    41: "Calvé Pindakaas Original",
-    42: "La Molisana Penne rigate",
-    43: "Natural Happiness proteïnemix",
-    44: "Duyvis Oven roasted pinda's original",
-    45: "Bonduelle Zwarte bonen",
+    22: "Bolletje Oerknack Waldkorn",
+    23: "Bolletje Ontbijt Crackers Spelt Volkoren",
+    24: "Bonduelle Chilibonen in saus",
+    25: "Bonduelle Zwarte bonen",
+    26: "Bonne Maman Pindapasta romig",
+    27: "Calvé Pindakaas Original",
+    28: "De Cecco Penne Rigate Nr. 41",
+    29: "Duyvis Oven baked peanuts honey salt",
+    30: "Duyvis Oven roasted pinda's original",
+    31: "Ekoplaza Volkoren penne",
+    32: "Freshona Linzen Lentils lidl",
+    33: "Grand' Italia Penne tradizionali",
+    34: "Hak Bonen Bruine",
+    35: "Hak Kapucijners",
+    36: "Hak witte bonen in tomatensaus",
+    37: "Heinz Beanz",
+    38: "Jumbo's 100% Biologische Pindakaas Naturel",
+    39: "Jumbo Groentecrackers Wortel & Zoete Aardappel",
+    40: "Jumbo Haverdrink Naturel",
+    41: "Jumbo Hollandse Bruine Bonen",
+    42: "Jumbo Organic Whole Wheat Rigatoni",
+    43: "Jumbo Penne Rigate Whole Wheat",
+    44: "Jumbo's 100% Natural Peanut Butter",
+    45: "Jumbo Sojadrink Naturel",
     46: "Jumbo Stevige Crackers Spelt 8",
-    47: "AH Terra Elitehaver ongebrand",
-    48: "Bolletje Ontbijt Crackers Spelt Volkoren",
-    49: "Bonduelle Chilibonen in saus",
-    50: "Jumbo Studentenhaver Ongezouten",
-    51: "Skippy Creamy peanut butter",
-    52: "Alpro Barista soja",
-    53: "Lidl cashew cranberrymix mix alesto",
-    54: "De Cecco Penne Rigate Nr. 41",
-    55: "AH Terra Noten cranberry rozijn mix ongebrand",
-    56: "AH Biologisch Penne",
-    57: "Alesto Noten mix",
-    58: "TastyBasics Low carb-high protein cracker meerzaden",
-    59: "AH Stevige crackers waldkorn",
-    60: "Hak witte bonen in tomatensaus",
+    47: "Jumbo Studentenhaver Ongezouten",
+    48: "La bioidea Penne",
+    49: "La Molisana Penne rigate",
+    50: "Lidl cashew cranberrymix mix alesto",
+    51: "Luna E Terra Pindakaas Smooth Bio",
+    52: "Natural Happiness nut mix Raw",
+    53: "Natural Happiness proteïnemix",
+    54: "Oatly! Organic oat drink",
+    55: "Rude Health Barista soja",
+    56: "Rummo Volkoren Biologische Penne Rigate",
+    57: "Skippy Creamy peanut butter",
+    58: "Smaakt Bio Zwarte Bonen",
+    59: "TastyBasics Low carb-high protein cracker meerzaden",
+    60: "Whole earth Drizzler golden roasted peanut butter",
 }
 
 SCHIJF_VAN_VIJF = {
@@ -199,13 +202,30 @@ SCHIJF_VAN_VIJF = {
     "Ecoplaza Pastasaus sugo tradizionale": False,
 }
 
-NUM_PRODUCT_CLASSES = len(CLASS_MAPPING)
-MIN_TRACKING_SCORE = 0.2
-TRACK_ACTIVATION_SCORE = 0.5
-TRACK_HIGH_CONF_SCORE = 0.5
-TRACK_HOLD_FRAMES = 3
-TRACK_MEMORY_TTL_FRAMES = 30
-CLASS_VOTE_DECAY = 0.8
+# --- Shared settings (overrides persisted to disk) ---
+
+SETTINGS_FILE = pathlib.Path(__file__).parent / "settings.json"
+
+
+def load_overrides():
+    try:
+        data = json.loads(SETTINGS_FILE.read_text())
+        return data.get("overrides", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_overrides(overrides):
+    SETTINGS_FILE.write_text(json.dumps({"overrides": overrides}, indent=2))
+
+
+# Global overrides dict (product_name -> bool), applied on top of SCHIJF_VAN_VIJF
+health_overrides = load_overrides()
+
+NUM_PRODUCT_CLASSES = max(CLASS_MAPPING) + 1
+MIN_TRACKING_SCORE = 0.5
+TRACK_ACTIVATION_SCORE = 0.7
+TRACK_HIGH_CONF_SCORE = 0.9
 
 # --- Coordinate math ---
 
@@ -243,14 +263,19 @@ def softmax(x):
 
 
 def build_detection(xyxy, class_id, confidence, tracker_id=None):
-    mapped_id = int(class_id) + 1
-    class_name = CLASS_MAPPING[mapped_id]
+    class_name = CLASS_MAPPING[int(class_id)]
     x1, y1, x2, y2 = xyxy
+
+    # Apply user overrides on top of default health data
+    if class_name in health_overrides:
+        healthy = health_overrides[class_name]
+    else:
+        healthy = SCHIJF_VAN_VIJF.get(class_name, True)
 
     det = {
         "class": class_name,
         "confidence": float(confidence),
-        "in_schijf_van_vijf": SCHIJF_VAN_VIJF.get(class_name, True),
+        "in_schijf_van_vijf": healthy,
         "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
     }
     if tracker_id is not None:
@@ -258,23 +283,67 @@ def build_detection(xyxy, class_id, confidence, tracker_id=None):
     return det
 
 
-def get_track_state(track_memory, track_id):
-    state = track_memory.get(track_id)
-    if state is None:
-        state = {
-            "bbox": None,
-            "confidence": 0.0,
-            "miss_count": 0,
-            "stable_class_id": None,
-            "class_votes": np.zeros(NUM_PRODUCT_CLASSES, dtype=np.float32),
-        }
-        track_memory[track_id] = state
-    return state
+def clamp(n, lo, hi):
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
 
 
-def build_stable_detections(sv_dets, track_memory):
+def draw_detections(image, detections):
+    draw = ImageDraw.Draw(image)
+    w, h = image.size
+
+    for det in detections:
+        x, y, bw, bh = det["bbox"]
+        x2 = x + bw
+        y2 = y + bh
+
+        x = clamp(x, 0, w - 1)
+        y = clamp(y, 0, h - 1)
+        x2 = clamp(x2, 0, w - 1)
+        y2 = clamp(y2, 0, h - 1)
+        if x2 <= x or y2 <= y:
+            continue
+
+        is_healthy = det.get("in_schijf_van_vijf", True)
+        color = "green" if is_healthy else "red"
+        draw.rectangle([x, y, x2, y2], outline=color, width=3)
+        label = f"{det['class']} | {det['confidence']:.2f}"
+        if "tracker_id" in det:
+            label += f" | id {det['tracker_id']}"
+        draw.text((x + 2, y + 2), label, fill=color)
+
+
+def run_model_inference(image, min_score):
+    raw_detections = model.predict(image, threshold=min_score)
+
+    if len(raw_detections) == 0:
+        return sv.Detections.empty()
+
+    class_ids = raw_detections.class_id.astype(int)
+    valid_mask = np.array(
+        [int(class_id) in CLASS_MAPPING for class_id in class_ids],
+        dtype=bool,
+    )
+
+    if not np.any(valid_mask):
+        return sv.Detections.empty()
+
+    confidence = raw_detections.confidence
+    if confidence is None:
+        confidence = np.ones(len(raw_detections), dtype=np.float32)
+
+    return sv.Detections(
+        xyxy=raw_detections.xyxy[valid_mask].astype(np.float32),
+        confidence=confidence[valid_mask].astype(np.float32),
+        class_id=class_ids[valid_mask].astype(int),
+    )
+
+
+def build_tracked_detections(sv_dets):
     detections = []
-    seen_track_ids = set()
 
     for i in range(len(sv_dets)):
         track_id = None
@@ -285,115 +354,87 @@ def build_stable_detections(sv_dets, track_memory):
         if track_id is None or track_id < 0:
             continue
 
-        seen_track_ids.add(track_id)
-        state = get_track_state(track_memory, track_id)
         class_id = int(sv_dets.class_id[i])
         confidence = float(sv_dets.confidence[i])
         bbox = sv_dets.xyxy[i].astype(np.float32).copy()
 
-        state["class_votes"] *= CLASS_VOTE_DECAY
-        state["class_votes"][class_id] += confidence
-        state["stable_class_id"] = int(np.argmax(state["class_votes"]))
-        state["bbox"] = bbox
-        state["confidence"] = confidence
-        state["miss_count"] = 0
-
         detections.append(
             build_detection(
                 bbox,
-                state["stable_class_id"],
+                class_id,
                 confidence,
                 tracker_id=track_id,
             )
         )
 
-    stale_track_ids = []
-    for track_id, state in list(track_memory.items()):
-        if track_id in seen_track_ids:
-            continue
-
-        state["miss_count"] += 1
-        if (
-            state["miss_count"] <= TRACK_HOLD_FRAMES
-            and state["bbox"] is not None
-            and state["stable_class_id"] is not None
-        ):
-            detections.append(
-                build_detection(
-                    state["bbox"],
-                    state["stable_class_id"],
-                    state["confidence"],
-                    tracker_id=track_id,
-                )
-            )
-
-        if state["miss_count"] > TRACK_MEMORY_TTL_FRAMES:
-            stale_track_ids.append(track_id)
-
-    for track_id in stale_track_ids:
-        del track_memory[track_id]
-
     return detections
 
 
-def run_inference_sync(image_bytes, request_id, tracker, track_memory):
+def build_raw_detections(sv_dets):
+    detections = []
+    for i in range(len(sv_dets)):
+        detections.append(
+            build_detection(
+                sv_dets.xyxy[i].astype(np.float32).copy(),
+                int(sv_dets.class_id[i]),
+                float(sv_dets.confidence[i]),
+            )
+        )
+    return detections
+
+
+def save_input_frame(image, request_id, detections=None):
+    if save_history_dir is None:
+        return
+
+    if len(save_history_slots) >= 10:
+        old_raw_path, old_annotated_path = save_history_slots.popleft()
+        for old_path in (old_raw_path, old_annotated_path):
+            try:
+                old_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    raw_path = save_history_dir / f"frame_{request_id:010d}.jpg"
+    image.save(raw_path, format="JPEG", quality=95)
+
+    annotated_path = save_history_dir / f"frame_{request_id:010d}_annotated.jpg"
+    annotated_image = image.copy()
+    draw_detections(annotated_image, detections or [])
+    annotated_image.save(annotated_path, format="JPEG", quality=95)
+
+    save_history_slots.append((raw_path, annotated_path))
+
+
+def run_inference_sync(image_bytes, request_id, tracker, no_track):
     try:
         # Decode
         npimg = np.frombuffer(image_bytes, np.uint8)
-        img = jpeg.decode(npimg, flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
+        img = jpeg.decode(
+            npimg,
+            pixel_format=TJPF_RGB,
+            flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT,
+        )
         if img is None:
             return {"error": "Failed to decode image"}
-
-        original_h, original_w = img.shape[:2]
-
-        # Preprocess (pure numpy, no torch)
         img = Image.fromarray(img)
-        img = ImageOps.pad(img, (model_w, model_h))
-        img_arr = np.asarray(img, dtype=np.float32) / 255.0
-        input_tensor = np.ascontiguousarray(
-            np.transpose(img_arr, (2, 0, 1))[np.newaxis, ...]
-        )
 
         # Inference
         start = perf_counter()
-        raw_results = session.run(None, {input_name: input_tensor})
+        sv_dets = run_model_inference(img, MIN_TRACKING_SCORE)
         inference_ms = (perf_counter() - start) * 1000
         print(f"inference {inference_ms:.1f}ms")
 
-        # Post-process (vectorized)
-        boxes = raw_results[output_map["dets"]][0]  # (N, 4)
-        logits = raw_results[output_map["labels"]][0]  # (N, 61)
-        probs = softmax(logits)
-
-        num_queries = boxes.shape[0]
-        class_ids = np.argmax(probs, axis=1)
-        scores = probs[np.arange(num_queries), class_ids]
-
-        valid_mask = (scores > MIN_TRACKING_SCORE) & (class_ids < NUM_PRODUCT_CLASSES)
-        mapped_ids = class_ids + 1
-        has_mapping = np.array([int(mid) in CLASS_MAPPING for mid in mapped_ids])
-        valid_mask = valid_mask & has_mapping
-
-        valid_boxes = boxes[valid_mask]
-        valid_scores = scores[valid_mask]
-        valid_class_ids = class_ids[valid_mask]
-
-        if len(valid_boxes) == 0:
-            sv_dets = tracker.update(sv.Detections.empty())
+        if no_track:
+            detections = build_raw_detections(sv_dets)
         else:
-            xyxy = get_real_coordinates(
-                valid_boxes, original_w, original_h, model_dim=model_w
-            )
+            if len(sv_dets) == 0:
+                sv_dets = tracker.update(sv.Detections.empty())
+            else:
+                sv_dets = tracker.update(sv_dets)
+            detections = build_tracked_detections(sv_dets)
 
-            # ByteTrack
-            sv_dets = sv.Detections(
-                xyxy=xyxy.astype(np.float32),
-                confidence=valid_scores.astype(np.float32),
-                class_id=valid_class_ids.astype(int),
-            )
-            sv_dets = tracker.update(sv_dets)
-
-        detections = build_stable_detections(sv_dets, track_memory)
+        save_input_frame(img, request_id, detections)
 
         return {"detections": detections, "requestId": request_id}
 
@@ -405,7 +446,7 @@ def run_inference_sync(image_bytes, request_id, tracker, track_memory):
 # --- WebSocket server ---
 
 
-async def inference_worker(websocket, queue, tracker, track_memory):
+async def inference_worker(websocket, queue, tracker, no_track):
     while True:
         message = await queue.get()
         try:
@@ -420,7 +461,7 @@ async def inference_worker(websocket, queue, tracker, track_memory):
                 image_bytes,
                 request_id,
                 tracker,
-                track_memory,
+                no_track,
             )
             await websocket.send(json.dumps(response))
         except Exception as e:
@@ -429,22 +470,42 @@ async def inference_worker(websocket, queue, tracker, track_memory):
             queue.task_done()
 
 
-async def handler(websocket):
-    queue = asyncio.Queue(maxsize=10)
+async def handler(websocket, no_track):
+    queue = asyncio.Queue(maxsize=1)
     tracker = ByteTrackTracker(
         track_activation_threshold=TRACK_ACTIVATION_SCORE,
         high_conf_det_threshold=TRACK_HIGH_CONF_SCORE,
         minimum_consecutive_frames=1,
     )
-    track_memory = {}
     worker_task = asyncio.create_task(
-        inference_worker(websocket, queue, tracker, track_memory)
+        inference_worker(websocket, queue, tracker, no_track)
     )
     client = getattr(websocket, "remote_address", None)
     print(f"Client connected: {client}")
 
     try:
         async for message in websocket:
+            # Text messages are settings commands
+            if isinstance(message, str):
+                try:
+                    data = json.loads(message)
+                    if data.get("type") == "save_settings":
+                        overrides = data.get("overrides", {})
+                        health_overrides.clear()
+                        health_overrides.update(overrides)
+                        save_overrides(overrides)
+                        print(f"Settings saved: {len(overrides)} overrides")
+                    elif data.get("type") == "get_settings":
+                        await websocket.send(
+                            json.dumps(
+                                {"type": "settings", "overrides": health_overrides}
+                            )
+                        )
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Settings error: {e}")
+                continue
+
+            # Binary messages are image frames
             if queue.full():
                 try:
                     queue.get_nowait()
@@ -459,9 +520,34 @@ async def handler(websocket):
         worker_task.cancel()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--no-track",
+        action="store_true",
+        help="Disable ByteTrack and return raw model detections directly.",
+    )
+    parser.add_argument(
+        "--save-history",
+        action="store_true",
+        help="Save the last 10 decoded input frames before inference.",
+    )
+    return parser.parse_args()
+
+
 async def main():
+    global save_history_dir
+    args = parse_args()
+    if args.save_history:
+        save_history_dir = pathlib.Path(__file__).parent / "inference-history"
+        save_history_dir.mkdir(parents=True, exist_ok=True)
+        for path in save_history_dir.glob("frame_*.jpg"):
+            path.unlink()
+        print(f"Saving last 10 input frames to {save_history_dir}")
     print("Starting WebSocket server on 0.0.0.0:5174...")
-    async with websockets.serve(handler, "0.0.0.0", 5174):
+    async with websockets.serve(
+        lambda websocket: handler(websocket, args.no_track), "0.0.0.0", 5174
+    ):
         await asyncio.Future()
 
 

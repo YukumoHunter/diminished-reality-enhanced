@@ -26,6 +26,24 @@ video {
   object-fit: cover;
 }
 
+.native-blur-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  display: none;
+  overflow: hidden;
+}
+
+.native-blur-box {
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: rgba(255, 255, 255, 0.001);
+  will-change: transform, width, height, opacity, backdrop-filter;
+  contain: paint;
+}
+
 .overlay-canvas {
   position: absolute;
   inset: 0;

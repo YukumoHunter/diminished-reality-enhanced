@@ -52,6 +52,7 @@ export default function Settings({
 
         <div className="setting-section">
           <h3>Product overrides</h3>
+          <p className="setting-hint">Checked = healthy (in Schijf van Vijf)</p>
           <div className="product-list">
             {ALL_PRODUCTS.map(p => {
               const healthy = classOverrides[p] ?? SCHIJF_VAN_VIJF[p];
