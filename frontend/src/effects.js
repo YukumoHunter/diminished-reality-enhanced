@@ -59,6 +59,21 @@ function captureToDisplay(bbox, captureW, captureH, videoW, videoH, displayW, di
   return [dx, dy, dw, dh];
 }
 
+export function captureDeltaToDisplay(deltaX, deltaY, captureW, captureH, videoW, videoH, displayW, displayH) {
+  if (!captureW || !captureH || !videoW || !videoH || !displayW || !displayH) {
+    return [0, 0];
+  }
+
+  const scaleX = videoW / captureW;
+  const scaleY = videoH / captureH;
+  const { sw, sh } = getCoverCrop(videoW, videoH, displayW, displayH);
+
+  return [
+    deltaX * scaleX * (displayW / sw),
+    deltaY * scaleY * (displayH / sh),
+  ];
+}
+
 // --- iOS manual pixel effects ---
 
 function manualBlur(imageData, radius) {

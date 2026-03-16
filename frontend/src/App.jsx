@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
-import { prepareRenderDetections, renderEffects, EFFECT, EFFECT_STRENGTH, OUTLINE } from './effects';
+import { captureDeltaToDisplay, prepareRenderDetections, renderEffects, EFFECT, EFFECT_STRENGTH, OUTLINE } from './effects';
+import { compensateDetections, createMotionState, getCompensationShift, getMotionCanvasSize, getMotionPose, updateMotionFromVideo } from './motion';
 import Settings from './Settings';
 
 const CAPTURE_LONGEST = 640;
@@ -14,8 +15,19 @@ function supportsNativeBlur() {
   );
 }
 
-function syncNativeBlurLayer(layer, detections) {
+const nativeBlurCache = new WeakMap();
+
+function boxesEqual(a, b) {
+  return Math.abs(a.x - b.x) < 0.25 &&
+    Math.abs(a.y - b.y) < 0.25 &&
+    Math.abs(a.w - b.w) < 0.25 &&
+    Math.abs(a.h - b.h) < 0.25 &&
+    Math.abs(a.opacity - b.opacity) < 0.01;
+}
+
+function syncNativeBlurLayer(layer, detections, offsetX = 0, offsetY = 0) {
   if (!layer) return;
+  const cached = nativeBlurCache.get(layer) ?? { boxes: [], offsetX: 0, offsetY: 0 };
 
   while (layer.childElementCount > detections.length) {
     layer.lastElementChild.remove();
@@ -28,7 +40,32 @@ function syncNativeBlurLayer(layer, detections) {
   }
 
   layer.style.display = detections.length ? 'block' : 'none';
+  if (!detections.length) {
+    layer.style.transform = '';
+    nativeBlurCache.set(layer, { boxes: [], offsetX: 0, offsetY: 0 });
+    return;
+  }
 
+  if (Math.abs(cached.offsetX - offsetX) >= 0.25 || Math.abs(cached.offsetY - offsetY) >= 0.25) {
+    layer.style.transform = `translate3d(${offsetX}px, ${offsetY}px, 0)`;
+  }
+
+  let needsBoxSync = cached.boxes.length !== detections.length;
+  if (!needsBoxSync) {
+    for (let i = 0; i < detections.length; i++) {
+      if (!boxesEqual(cached.boxes[i], detections[i])) {
+        needsBoxSync = true;
+        break;
+      }
+    }
+  }
+
+  if (!needsBoxSync) {
+    nativeBlurCache.set(layer, { boxes: cached.boxes, offsetX, offsetY });
+    return;
+  }
+
+  const nextBoxes = [];
   for (let i = 0; i < detections.length; i++) {
     const det = detections[i];
     const box = layer.children[i];
@@ -40,13 +77,24 @@ function syncNativeBlurLayer(layer, detections) {
     box.style.opacity = `${det.opacity}`;
     box.style.backdropFilter = blur;
     box.style.webkitBackdropFilter = blur;
+
+    nextBoxes.push({
+      x: det.x,
+      y: det.y,
+      w: det.w,
+      h: det.h,
+      opacity: det.opacity,
+    });
   }
+
+  nativeBlurCache.set(layer, { boxes: nextBoxes, offsetX, offsetY });
 }
 
 function App() {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   const captureCanvasRef = useRef(null);
+  const motionCanvasRef = useRef(null);
   const containerRef = useRef(null);
   const blurLayerRef = useRef(null);
 
@@ -59,7 +107,7 @@ function App() {
 
   // Refs for rAF-accessible state
   const settingsRef = useRef({ effect, outlineMode, outlineColor, classOverrides });
-  const detectionsRef = useRef([]);
+  const detectionsRef = useRef({ items: [], anchorPose: null });
   const captureSize = useRef({ w: 0, h: 0 });
   const wsRef = useRef(null);
   const pendingRef = useRef(false);
@@ -67,6 +115,8 @@ function App() {
   const requestIdRef = useRef(0);
   const lastSendAtRef = useRef(0);
   const nativeBlurSupportedRef = useRef(supportsNativeBlur());
+  const motionStateRef = useRef(createMotionState());
+  const sentPoseByRequestRef = useRef(new Map());
 
   // Sync settings to ref
   useEffect(() => {
@@ -120,6 +170,11 @@ function App() {
       captureCanvasRef.current.width = cw;
       captureCanvasRef.current.height = ch;
     }
+    const motionSize = getMotionCanvasSize(vw, vh);
+    if (motionCanvasRef.current) {
+      motionCanvasRef.current.width = motionSize.width;
+      motionCanvasRef.current.height = motionSize.height;
+    }
   }, []);
 
   // --- WebSocket ---
@@ -142,7 +197,8 @@ function App() {
       ws.onclose = (event) => {
         console.log('WS close', { code: event.code, reason: event.reason });
         setConnected(false);
-        detectionsRef.current = [];
+        detectionsRef.current = { items: [], anchorPose: null };
+        sentPoseByRequestRef.current.clear();
         wsRef.current = null;
         reconnectTimer = setTimeout(connect, 2000);
       };
@@ -162,7 +218,19 @@ function App() {
             }
             return;
           }
-          detectionsRef.current = data.detections || [];
+          const requestId = data.requestId;
+          const anchorPose = requestId !== undefined
+            ? sentPoseByRequestRef.current.get(requestId) ?? getMotionPose(motionStateRef.current)
+            : getMotionPose(motionStateRef.current);
+          detectionsRef.current = { items: data.detections || [], anchorPose };
+
+          if (requestId !== undefined) {
+            for (const key of Array.from(sentPoseByRequestRef.current.keys())) {
+              if (key <= requestId) {
+                sentPoseByRequestRef.current.delete(key);
+              }
+            }
+          }
         } catch (e) {
           console.error('WS message error:', e);
         }
@@ -185,9 +253,11 @@ function App() {
     let rafId;
 
     const loop = () => {
+      const now = performance.now();
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const capCanvas = captureCanvasRef.current;
+      const motionCanvas = motionCanvasRef.current;
       const blurLayer = blurLayerRef.current;
 
       if (video && canvas && video.readyState >= 2) {
@@ -195,26 +265,36 @@ function App() {
         const rect = video.getBoundingClientRect();
         if (canvas.width !== rect.width) canvas.width = rect.width;
         if (canvas.height !== rect.height) canvas.height = rect.height;
+        const shouldTrackMotion = wsRef.current?.readyState === WebSocket.OPEN ||
+          pendingRef.current ||
+          detectionsRef.current.items.length > 0;
+        if (shouldTrackMotion) {
+          updateMotionFromVideo(video, motionCanvas, motionStateRef.current, now);
+        }
 
         // Send frame if WS is ready and not waiting for response
         if (wsRef.current?.readyState === WebSocket.OPEN && !pendingRef.current && capCanvas) {
           const { w: cw, h: ch } = captureSize.current;
-          const now = performance.now();
           if (cw > 0 && ch > 0 && now - lastSendAtRef.current >= MIN_SEND_INTERVAL) {
             pendingRef.current = true;
             lastSendAtRef.current = now;
 
             const cCtx = capCanvas.getContext('2d');
             cCtx.drawImage(video, 0, 0, cw, ch);
+            requestIdRef.current = (requestIdRef.current + 1) & 0xFFFFFFFF;
+            const id = requestIdRef.current;
+            sentPoseByRequestRef.current.set(id, getMotionPose(motionStateRef.current));
+            while (sentPoseByRequestRef.current.size > 8) {
+              const oldest = sentPoseByRequestRef.current.keys().next().value;
+              sentPoseByRequestRef.current.delete(oldest);
+            }
 
             capCanvas.toBlob((blob) => {
               if (!blob || wsRef.current?.readyState !== WebSocket.OPEN) {
                 pendingRef.current = false;
+                sentPoseByRequestRef.current.delete(id);
                 return;
               }
-
-              requestIdRef.current = (requestIdRef.current + 1) & 0xFFFFFFFF;
-              const id = requestIdRef.current;
 
               blob.arrayBuffer().then((buf) => {
                 const msg = new ArrayBuffer(4 + buf.byteLength);
@@ -231,8 +311,41 @@ function App() {
 
         // Render effects
         const s = settingsRef.current;
+        const shift = getCompensationShift(
+          detectionsRef.current.anchorPose,
+          motionStateRef.current,
+          captureSize.current.w,
+          captureSize.current.h
+        );
+        const [blurOffsetX, blurOffsetY] = captureDeltaToDisplay(
+          shift.x,
+          shift.y,
+          captureSize.current.w,
+          captureSize.current.h,
+          video.videoWidth,
+          video.videoHeight,
+          rect.width,
+          rect.height
+        );
+        const baseRenderDetections = prepareRenderDetections(
+          detectionsRef.current.items,
+          s.classOverrides,
+          captureSize.current.w,
+          captureSize.current.h,
+          video.videoWidth,
+          video.videoHeight,
+          rect.width,
+          rect.height
+        );
+        const compensatedDetections = compensateDetections(
+          detectionsRef.current.items,
+          detectionsRef.current.anchorPose,
+          motionStateRef.current,
+          captureSize.current.w,
+          captureSize.current.h
+        );
         const renderDetections = prepareRenderDetections(
-          detectionsRef.current,
+          compensatedDetections,
           s.classOverrides,
           captureSize.current.w,
           captureSize.current.h,
@@ -246,8 +359,10 @@ function App() {
         syncNativeBlurLayer(
           blurLayer,
           useNativeBlur
-            ? renderDetections.filter((det) => !det.isHealthy && det.opacity > 0 && det.w > 0 && det.h > 0)
-            : []
+            ? baseRenderDetections.filter((det) => !det.isHealthy && det.opacity > 0 && det.w > 0 && det.h > 0)
+            : [],
+          useNativeBlur ? blurOffsetX : 0,
+          useNativeBlur ? blurOffsetY : 0
         );
 
         renderEffects(
@@ -292,6 +407,7 @@ function App() {
       <div ref={blurLayerRef} className="native-blur-layer" />
       <canvas ref={canvasRef} className="overlay-canvas" />
       <canvas ref={captureCanvasRef} style={{ display: 'none' }} />
+      <canvas ref={motionCanvasRef} style={{ display: 'none' }} />
 
       <div className="controls">
         <button className="ctrl-btn" onClick={toggleFullscreen} aria-label="Fullscreen">
