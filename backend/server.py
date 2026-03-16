@@ -224,7 +224,7 @@ health_overrides = load_overrides()
 
 NUM_PRODUCT_CLASSES = max(CLASS_MAPPING) + 1
 MIN_TRACKING_SCORE = 0.5
-TRACK_ACTIVATION_SCORE = 0.8
+TRACK_ACTIVATION_SCORE = 0.7
 TRACK_HIGH_CONF_SCORE = 0.9
 
 # --- Coordinate math ---

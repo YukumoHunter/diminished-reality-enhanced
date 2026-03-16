@@ -2,6 +2,10 @@ export const EFFECT = { NONE: 0, BLUR: 1, OVERLAY: 2, DESATURATE: 3 };
 export const OUTLINE = { OFF: 0, HEALTHY: 1, ALL: 2 };
 
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+const BLUR_PAD_MIN = 10;
+const BLUR_PAD_MAX = 28;
+const BLUR_PAD_RATIO = 0.14;
+const BLUR_PAD_STRENGTH_RATIO = 0.5;
 
 function createWorkingCanvas(width, height) {
   if (typeof OffscreenCanvas !== 'undefined') {
@@ -74,6 +78,33 @@ export function captureDeltaToDisplay(deltaX, deltaY, captureW, captureH, videoW
   ];
 }
 
+export function expandBlurRect(x, y, w, h, strength, boundsW, boundsH) {
+  if (w <= 0 || h <= 0 || boundsW <= 0 || boundsH <= 0) {
+    return { x, y, w, h };
+  }
+
+  const padX = Math.min(
+    BLUR_PAD_MAX,
+    Math.max(BLUR_PAD_MIN, strength * BLUR_PAD_STRENGTH_RATIO, w * BLUR_PAD_RATIO)
+  );
+  const padY = Math.min(
+    BLUR_PAD_MAX,
+    Math.max(BLUR_PAD_MIN, strength * BLUR_PAD_STRENGTH_RATIO, h * BLUR_PAD_RATIO)
+  );
+
+  const ex = Math.max(0, x - padX);
+  const ey = Math.max(0, y - padY);
+  const ex2 = Math.min(boundsW, x + w + padX);
+  const ey2 = Math.min(boundsH, y + h + padY);
+
+  return {
+    x: ex,
+    y: ey,
+    w: Math.max(0, ex2 - ex),
+    h: Math.max(0, ey2 - ey),
+  };
+}
+
 // --- iOS manual pixel effects ---
 
 function manualBlur(imageData, radius) {
@@ -123,10 +154,11 @@ function displayToVideoRect(x, y, w, h, videoW, videoH, displayW, displayH) {
 
 function applyBlur(ctx, video, x, y, w, h, strength) {
   if (strength <= 0) return;
-  const ix = Math.max(0, Math.floor(x));
-  const iy = Math.max(0, Math.floor(y));
-  const iw = Math.min(ctx.canvas.width - ix, Math.ceil(w));
-  const ih = Math.min(ctx.canvas.height - iy, Math.ceil(h));
+  const expanded = expandBlurRect(x, y, w, h, strength, ctx.canvas.width, ctx.canvas.height);
+  const ix = Math.max(0, Math.floor(expanded.x));
+  const iy = Math.max(0, Math.floor(expanded.y));
+  const iw = Math.min(ctx.canvas.width - ix, Math.ceil(expanded.w));
+  const ih = Math.min(ctx.canvas.height - iy, Math.ceil(expanded.h));
   if (iw <= 0 || ih <= 0) return;
 
   // Sample past the detection bounds so the blur stays full-strength up to the edge.
